@@ -4,7 +4,7 @@ import string
 import math
 import numpy as np
 from PySide2.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize
-from PySide2.QtGui import QPen, QFont, QBrush, QColor, QCursor, QMouseEvent, QPainter, QPainterPath, QTransform
+from PySide2.QtGui import QPen, QFont, QBrush, QColor, QMouseEvent, QPainter, QPainterPath, QTransform
 from PySide2.QtWidgets import QApplication, QGraphicsView, QGraphicsScene
 from PySide2.QtWidgets import QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsItem, QRubberBand
 
@@ -978,6 +978,7 @@ class this_view(QGraphicsView):
         self.zoom_level  = 1.0
         self.selected_point = None
         self.dragged_node = None
+        self.pending_main_uv_index = None
         self.current_patch = None
         self.current_extended_patch = None
         self.selected_edges = []
@@ -1088,21 +1089,7 @@ class this_view(QGraphicsView):
         ):
             self.scene().removeItem(self.current_extended_patch)
         self.current_extended_patch = None
-
-    def selected_main_uv_index_under_cursor(self):
-        viewport_position = self.viewport().mapFromGlobal(QCursor.pos())
-        selected_ids = {id(edge) for edge in self.selected_edges}
-        matching_edges = []
-        for item in self.items(viewport_position):
-            if (
-                isinstance(item, boundary_edge)
-                and id(item) in selected_ids
-                and getattr(item, "active", True)
-            ):
-                matching_edges.append(item)
-        if len(matching_edges) == 1:
-            return matching_edges[0].uv_index
-        return None
+        self.pending_main_uv_index = None
 
 
     def keyPressEvent(self, event):
@@ -1118,6 +1105,16 @@ class this_view(QGraphicsView):
             nr = event.key() - Qt.Key_0
             self.current_extended_patch.set_radial_layers(nr)
             print("extended patch radial layers:", nr)
+            return
+        if (
+            self.current_extended_patch is None
+            and event.key() in (Qt.Key_1, Qt.Key_2)
+        ):
+            self.pending_main_uv_index = event.key() - Qt.Key_0
+            print(
+                "extended patch pending main uv_index:",
+                self.pending_main_uv_index,
+            )
             return
         if event.key() == Qt.Key_Escape:
             self.clear_selection()
@@ -1155,15 +1152,23 @@ class this_view(QGraphicsView):
                     "element =", edge.element_index,
                     "side =", getattr(edge, "element_side", None),
                 )
-            main_uv_index = self.selected_main_uv_index_under_cursor()
+            main_uv_index = self.pending_main_uv_index
             if main_uv_index is not None:
-                print("extended patch main uv from cursor:", main_uv_index)
+                print("extended patch main uv_index:", main_uv_index)
             try:
                 boundary_topology = ordered_extended_boundary_topology(
                     self.selected_edges, main_uv_index=main_uv_index
                 )
             except ValueError as error:
                 print("extended topology detection failed:", error)
+                if (
+                    main_uv_index is None
+                    and "Ambiguous extended patch" in str(error)
+                ):
+                    print(
+                        "Press 1 or 2 to choose the extended-patch main "
+                        "boundary direction, then press E again"
+                    )
                 boundary_topology = None
             if boundary_topology is not None:
                 ordered_nodes = boundary_topology.inner_nodes
@@ -1182,6 +1187,17 @@ class this_view(QGraphicsView):
                 ordered_nodes, ordered_edges = ordered_edge_chain(
                     self.selected_edges
                 )
+            if (
+                boundary_topology is not None
+                and boundary_topology.start_cap_edges
+                and boundary_topology.end_cap_edges
+            ):
+                topology_error = two_cap_topology_error(
+                    boundary_topology, ordered_nodes
+                )
+                if topology_error:
+                    print(topology_error)
+                    return
             if (
                 self.current_patch is not None
                 and isinstance(self.current_patch, QGraphicsItem)
@@ -1203,6 +1219,9 @@ class this_view(QGraphicsView):
                 and boundary_topology.end_cap_edge is not None
             ):
                 self.current_extended_patch.capped_gap = boundary_topology
+                self.current_extended_patch.radial_layers = len(
+                    boundary_topology.start_cap_edges
+                )
                 segment_count = len(ordered_edges)
                 start = boundary_topology.outer_start_node.position
                 end = boundary_topology.outer_end_node.position
@@ -1229,6 +1248,7 @@ class this_view(QGraphicsView):
                 self.current_extended_patch.radial_layers = len(cap_edges)
                 self.current_extended_patch.redraw()
             self.scene().addItem(self.current_extended_patch)
+            self.pending_main_uv_index = None
             print(
                 "extended patch ordered node indices:",
                 [node.index for node in ordered_nodes],
@@ -1799,13 +1819,6 @@ def add_extended_patch_to_nodes_elements(patch):
     if patch.capped_gap is not None:
         return add_capped_gap_to_nodes_elements(patch)
     if patch.one_cap_topology is not None:
-        cap_edges = (
-            patch.one_cap_topology.start_cap_edges
-            or patch.one_cap_topology.end_cap_edges
-        )
-        if len(cap_edges) > 1:
-            print("Multi-layer one-cap element creation is not implemented yet")
-            return
         return add_one_cap_gap_to_nodes_elements(patch)
     if not patch.can_commit:
         print("Element creation for capped boundary gaps is not implemented yet")
@@ -1867,45 +1880,199 @@ def add_extended_patch_to_nodes_elements(patch):
     return node_rows, created_elements
 
 
+def two_cap_topology_error(topology, ordered_nodes):
+    start_cap_edges = list(topology.start_cap_edges)
+    end_cap_edges = list(topology.end_cap_edges)
+    start_cap_nodes = list(topology.start_cap_nodes)
+    end_cap_nodes = list(topology.end_cap_nodes)
+    if not start_cap_edges or not end_cap_edges:
+        return "Two-cap extended patch requires exactly two cap chains"
+    if len(start_cap_edges) != len(end_cap_edges):
+        return "Two-cap extended patch requires equal cap-chain lengths"
+    radial_layers = len(start_cap_edges)
+    if len(start_cap_nodes) != radial_layers + 1:
+        return "Two-cap start node count does not match its cap chain"
+    if len(end_cap_nodes) != radial_layers + 1:
+        return "Two-cap end node count does not match its cap chain"
+    if start_cap_nodes[0] is not ordered_nodes[0]:
+        return "Two-cap start chain is not ordered from the main-row endpoint"
+    if end_cap_nodes[0] is not ordered_nodes[-1]:
+        return "Two-cap end chain is not ordered from the main-row endpoint"
+    for radial_index in range(radial_layers):
+        if frozenset(start_cap_edges[radial_index].vertices) != frozenset((
+            start_cap_nodes[radial_index].index,
+            start_cap_nodes[radial_index + 1].index,
+        )):
+            return "Two-cap start edge does not connect consecutive cap nodes"
+        if frozenset(end_cap_edges[radial_index].vertices) != frozenset((
+            end_cap_nodes[radial_index].index,
+            end_cap_nodes[radial_index + 1].index,
+        )):
+            return "Two-cap end edge does not connect consecutive cap nodes"
+    return None
+
+
+def add_two_cap_extended_row(
+    inner_nodes, inner_edges, target_positions,
+    start_cap_edge, end_cap_edge, fixed_start_node, fixed_end_node,
+    reference_inner_nodes=None,
+):
+    """Create one radial row whose two endpoints are existing cap nodes."""
+    if len(inner_nodes) != len(inner_edges) + 1:
+        raise ValueError("Two-cap inner row has inconsistent node/edge counts")
+    if len(target_positions) != len(inner_nodes):
+        raise ValueError("Two-cap target row has the wrong number of positions")
+    if frozenset(start_cap_edge.vertices) != frozenset((
+        inner_nodes[0].index, fixed_start_node.index,
+    )):
+        raise ValueError("Two-cap start edge connects unexpected nodes")
+    if frozenset(end_cap_edge.vertices) != frozenset((
+        inner_nodes[-1].index, fixed_end_node.index,
+    )):
+        raise ValueError("Two-cap end edge connects unexpected nodes")
+    if not np.allclose(
+        np_point(target_positions[0]), np_point(fixed_start_node.position)
+    ):
+        raise ValueError("Two-cap target row has the wrong fixed start node")
+    if not np.allclose(
+        np_point(target_positions[-1]), np_point(fixed_end_node.position)
+    ):
+        raise ValueError("Two-cap target row has the wrong fixed end node")
+    if reference_inner_nodes is not None and (
+        len(reference_inner_nodes) != len(inner_nodes)
+    ):
+        raise ValueError("Two-cap radial reference row has the wrong node count")
+
+    first_new_node_index = len(node_list)
+    first_new_element_index = len(element_list)
+    next_nodes = [fixed_start_node]
+    if len(inner_edges) == 1:
+        if add_element_from_three_edges(
+            inner_edges[0], start_cap_edge, end_cap_edge
+        ) is None:
+            return None
+    else:
+        transverse_edge = start_cap_edge
+        for column in range(len(inner_edges) - 1):
+            old_node_count = len(node_list)
+            radial_kwargs = {}
+            if reference_inner_nodes is not None:
+                radial_kwargs = {
+                    "radial_reference_node": reference_inner_nodes[column + 1],
+                    "radial_column": column + 1,
+                }
+            if add_element_from_two_edges(
+                inner_edges[column], transverse_edge,
+                target_positions[column + 1],
+                **radial_kwargs
+            ) is None:
+                return None
+            if len(node_list) != old_node_count + 1:
+                raise ValueError(
+                    "Two-cap row did not create exactly one interior node"
+                )
+            next_node = node_list[-1]
+            if not np.allclose(
+                np_point(next_node.position),
+                np_point(target_positions[column + 1]),
+            ):
+                raise ValueError(
+                    "Two-cap interior node does not match its target position"
+                )
+            next_nodes.append(next_node)
+            transverse_edge = find_boundary_edge_between_nodes(
+                inner_nodes[column + 1], next_node
+            )
+        old_node_count = len(node_list)
+        if add_element_from_three_edges(
+            inner_edges[-1], transverse_edge, end_cap_edge
+        ) is None:
+            return None
+        if len(node_list) != old_node_count:
+            raise ValueError("Two-cap row closure unexpectedly created a node")
+
+    if len(node_list) != first_new_node_index + max(len(inner_edges) - 1, 0):
+        raise ValueError("Two-cap row created an unexpected number of nodes")
+    next_nodes.append(fixed_end_node)
+    next_edges = [
+        find_boundary_edge_between_nodes(next_nodes[index], next_nodes[index + 1])
+        for index in range(len(next_nodes) - 1)
+    ]
+    created_elements = element_list[first_new_element_index:]
+    if len(created_elements) != len(inner_edges):
+        raise ValueError("Two-cap row created an unexpected number of elements")
+    return next_nodes, next_edges, created_elements
+
+
 def add_capped_gap_to_nodes_elements(patch):
     gap = patch.capped_gap
-    inner_nodes = list(gap.inner_nodes)
-    inner_edges = list(gap.inner_edges)
-    outer_positions = [node.position for node in patch.outer_nodes]
-    first_new_element_index = len(element_list)
-    left_transverse_edge = gap.start_side_edge
-
-    for index, inner_edge in enumerate(inner_edges):
-        is_last_element = index == len(inner_edges) - 1
-        if is_last_element:
-            element = add_element_from_three_edges(
-                inner_edge, left_transverse_edge, gap.end_side_edge
-            )
-        else:
-            element = add_element_from_two_edges(
-                inner_edge, left_transverse_edge,
-                outer_positions[index + 1],
-            )
-        if element is None:
+    topology_error = two_cap_topology_error(gap, patch.ordered_nodes)
+    if topology_error:
+        print(topology_error)
+        return
+    start_cap_edges = list(gap.start_cap_edges)
+    end_cap_edges = list(gap.end_cap_edges)
+    start_cap_nodes = list(gap.start_cap_nodes)
+    end_cap_nodes = list(gap.end_cap_nodes)
+    if len(patch.outer_nodes) != patch.required_outer_node_count:
+        print(
+            "Two-cap extended patch requires exactly",
+            patch.required_outer_node_count,
+            "outer preview nodes before commit",
+        )
+        return
+    if len(start_cap_edges) != patch.radial_layers:
+        print("Two-cap edge count does not match radial layer count")
+        return
+    if len(patch.preview_node_rows) != patch.radial_layers + 1:
+        print("Two-cap radial preview rows are incomplete")
+        return
+    if any(
+        len(row) != patch.required_outer_node_count
+        for row in patch.preview_node_rows
+    ):
+        print("Two-cap radial preview rows are incomplete")
+        return
+    for radial_index, row in enumerate(patch.preview_node_rows):
+        if row[0] is not start_cap_nodes[radial_index]:
+            print("Two-cap preview row does not reuse its start cap node")
             return
-        if not is_last_element:
-            left_transverse_edge = find_boundary_edge_to_position(
-                inner_nodes[index + 1], outer_positions[index + 1]
-            )
+        if row[-1] is not end_cap_nodes[radial_index]:
+            print("Two-cap preview row does not reuse its end cap node")
+            return
+    if patch.bezier_mode and patch.radial_layers > 1:
+        print("Multi-layer two-cap Bézier commit is not implemented yet")
+        return
+
+    inner_nodes = list(patch.ordered_nodes)
+    inner_edges = list(patch.ordered_edges)
+    reference_inner_nodes = list(patch.ordered_nodes)
+    first_new_element_index = len(element_list)
+    node_rows = [inner_nodes]
+    for radial_index in range(patch.radial_layers):
+        if inner_nodes[0] is not start_cap_nodes[radial_index]:
+            raise ValueError("Two-cap row has the wrong current start node")
+        if inner_nodes[-1] is not end_cap_nodes[radial_index]:
+            raise ValueError("Two-cap row has the wrong current end node")
+        target_positions = [
+            node.position for node in patch.preview_node_rows[radial_index + 1]
+        ]
+        row_result = add_two_cap_extended_row(
+            inner_nodes, inner_edges, target_positions,
+            start_cap_edges[radial_index], end_cap_edges[radial_index],
+            start_cap_nodes[radial_index + 1],
+            end_cap_nodes[radial_index + 1],
+            reference_inner_nodes=(
+                reference_inner_nodes if patch.radial_layers > 1 else None
+            ),
+        )
+        if row_result is None:
+            return
+        next_nodes, next_edges, unused_created_elements = row_result
+        inner_nodes, inner_edges = next_nodes, next_edges
+        node_rows.append(inner_nodes)
 
     created_elements = element_list[first_new_element_index:]
-    outer_nodes = [gap.outer_start]
-    for outer_position in outer_positions[1:-1]:
-        matches = [
-            node for node in node_list
-            if np.allclose(np_point(node.position), np_point(outer_position))
-        ]
-        if len(matches) != 1:
-            raise ValueError("Could not identify a created gap node")
-        outer_nodes.append(matches[0])
-    outer_nodes.append(gap.outer_end)
-    node_rows = [inner_nodes, outer_nodes]
-
     recompute_node_boundaries(node_list, boundary_list)
     rebuild_node_connections()
     if patch.scene() is scene:
@@ -1915,22 +2082,88 @@ def add_capped_gap_to_nodes_elements(patch):
     return node_rows, created_elements
 
 
-def cap_first_rows(topology, outer_positions):
+def cap_first_rows(topology, preview_node_rows):
     inner_nodes = list(topology.inner_nodes)
     inner_edges = list(topology.inner_edges)
-    outer_positions = list(outer_positions)
-    if topology.start_cap_edge is not None:
+    preview_node_rows = [list(row) for row in preview_node_rows]
+    if topology.start_cap_edges:
         return (
-            inner_nodes, inner_edges, outer_positions,
-            topology.start_cap_edge, topology.outer_start_node,
+            inner_nodes, inner_edges, preview_node_rows,
+            list(topology.start_cap_nodes), list(topology.start_cap_edges),
         )
     return (
         list(reversed(inner_nodes)),
         list(reversed(inner_edges)),
-        list(reversed(outer_positions)),
-        topology.end_cap_edge,
-        topology.outer_end_node,
+        [list(reversed(row)) for row in preview_node_rows],
+        list(topology.end_cap_nodes), list(topology.end_cap_edges),
     )
+
+
+def add_one_cap_extended_row(
+    inner_nodes, inner_edges, target_positions, cap_edge, fixed_outer_node,
+    reference_inner_nodes=None,
+):
+    """Create one cap-first radial row without duplicating its fixed node."""
+    if len(inner_nodes) != len(inner_edges) + 1:
+        raise ValueError("One-cap inner row has inconsistent node/edge counts")
+    if len(target_positions) != len(inner_nodes):
+        raise ValueError("One-cap target row has the wrong number of positions")
+    if inner_nodes[0].index not in cap_edge.vertices:
+        raise ValueError("One-cap edge is not attached to the inner-row endpoint")
+    if fixed_outer_node.index not in cap_edge.vertices:
+        raise ValueError("One-cap edge does not contain the fixed outer node")
+    if frozenset(cap_edge.vertices) != frozenset((
+        inner_nodes[0].index, fixed_outer_node.index,
+    )):
+        raise ValueError("One-cap edge connects unexpected nodes")
+    if not np.allclose(
+        np_point(target_positions[0]), np_point(fixed_outer_node.position)
+    ):
+        raise ValueError("One-cap target row does not start at its fixed cap node")
+    if reference_inner_nodes is not None and (
+        len(reference_inner_nodes) != len(inner_nodes)
+    ):
+        raise ValueError("One-cap radial reference row has the wrong node count")
+
+    first_new_node_index = len(node_list)
+    first_new_element_index = len(element_list)
+    left_transverse_edge = cap_edge
+    for index, inner_edge in enumerate(inner_edges):
+        if add_element_from_two_edges(
+            inner_edge, left_transverse_edge, target_positions[index + 1],
+            radial_reference_node=(
+                reference_inner_nodes[index + 1]
+                if reference_inner_nodes is not None else None
+            ),
+            radial_column=(
+                index + 1 if reference_inner_nodes is not None else None
+            ),
+        ) is None:
+            return None
+        if index < len(inner_edges) - 1:
+            left_transverse_edge = find_boundary_edge_to_position(
+                inner_nodes[index + 1], target_positions[index + 1]
+            )
+
+    new_nodes = list(node_list[first_new_node_index:])
+    if len(new_nodes) != len(inner_edges):
+        raise ValueError("One-cap row created an unexpected number of nodes")
+    next_nodes = [fixed_outer_node] + new_nodes
+    for index, (node, target_position) in enumerate(zip(
+        next_nodes, target_positions
+    )):
+        if not np.allclose(np_point(node.position), np_point(target_position)):
+            raise ValueError(
+                "One-cap row node {} does not match its target position".format(
+                    index
+                )
+            )
+    next_edges = [
+        find_boundary_edge_between_nodes(next_nodes[index], next_nodes[index + 1])
+        for index in range(len(next_nodes) - 1)
+    ]
+    created_elements = element_list[first_new_element_index:]
+    return next_nodes, next_edges, created_elements
 
 
 def add_one_cap_gap_to_nodes_elements(patch):
@@ -1942,38 +2175,81 @@ def add_one_cap_gap_to_nodes_elements(patch):
         )
         return
     topology = patch.one_cap_topology
-    (
-        inner_nodes, inner_edges, outer_positions,
-        left_transverse_edge, fixed_outer_node,
-    ) = cap_first_rows(
-        topology, [node.position for node in patch.outer_nodes]
+    start_cap_edges = list(topology.start_cap_edges)
+    end_cap_edges = list(topology.end_cap_edges)
+    if bool(start_cap_edges) == bool(end_cap_edges):
+        print("One-cap extended patch requires exactly one cap chain")
+        return
+    cap_edges = start_cap_edges or end_cap_edges
+    cap_nodes = list(
+        topology.start_cap_nodes if start_cap_edges else topology.end_cap_nodes
     )
-    first_new_node_index = len(node_list)
-    first_new_element_index = len(element_list)
+    if patch.bezier_mode and len(cap_edges) > 1:
+        print("Multi-layer one-cap Bézier commit is not implemented yet")
+        return
+    if len(cap_edges) != patch.radial_layers:
+        print("One-cap edge count does not match radial layer count")
+        return
+    if len(cap_nodes) != patch.radial_layers + 1:
+        print("One-cap node count does not match radial layer count")
+        return
+    if len(patch.preview_node_rows) != patch.radial_layers + 1:
+        print("One-cap radial preview rows are incomplete")
+        return
+    if any(
+        len(row) != patch.required_outer_node_count
+        for row in patch.preview_node_rows
+    ):
+        print("One-cap radial preview rows are incomplete")
+        return
 
-    for index, inner_edge in enumerate(inner_edges):
-        element = add_element_from_two_edges(
-            inner_edge, left_transverse_edge,
-            outer_positions[index + 1],
-        )
-        if element is None:
+    (
+        inner_nodes, inner_edges, preview_node_rows, cap_nodes, cap_edges,
+    ) = cap_first_rows(
+        topology, patch.preview_node_rows
+    )
+    reference_inner_nodes = list(inner_nodes)
+    for radial_index in range(patch.radial_layers):
+        expected_cap_indices = frozenset((
+            cap_nodes[radial_index].index,
+            cap_nodes[radial_index + 1].index,
+        ))
+        if frozenset(cap_edges[radial_index].vertices) != expected_cap_indices:
+            print("One-cap edge does not connect consecutive cap nodes")
             return
-        if index < len(inner_edges) - 1:
-            left_transverse_edge = find_boundary_edge_to_position(
-                inner_nodes[index + 1], outer_positions[index + 1]
-            )
+        if preview_node_rows[radial_index][0] is not cap_nodes[radial_index]:
+            print("One-cap preview row does not reuse its cap node")
+            return
+        if preview_node_rows[radial_index + 1][0] is not cap_nodes[radial_index + 1]:
+            print("One-cap preview row does not reuse its next cap node")
+            return
+        if not np.allclose(
+            np_point(preview_node_rows[radial_index + 1][0].position),
+            np_point(cap_nodes[radial_index + 1].position),
+        ):
+            print("One-cap target row does not start at its fixed cap node")
+            return
 
-    new_nodes = node_list[first_new_node_index:]
-    outer_nodes = [fixed_outer_node]
-    for outer_position in outer_positions[1:]:
-        matches = [
-            node for node in new_nodes
-            if np.allclose(np_point(node.position), np_point(outer_position))
+    first_new_element_index = len(element_list)
+    node_rows = [inner_nodes]
+    for radial_index in range(patch.radial_layers):
+        if inner_nodes[0] is not cap_nodes[radial_index]:
+            raise ValueError("One-cap row does not start at the expected cap node")
+        target_positions = [
+            node.position for node in preview_node_rows[radial_index + 1]
         ]
-        if len(matches) != 1:
-            raise ValueError("Could not identify a created one-cap outer node")
-        outer_nodes.append(matches[0])
-    node_rows = [inner_nodes, outer_nodes]
+        row_result = add_one_cap_extended_row(
+            inner_nodes, inner_edges, target_positions,
+            cap_edges[radial_index], cap_nodes[radial_index + 1],
+            reference_inner_nodes=(
+                reference_inner_nodes if patch.radial_layers > 1 else None
+            ),
+        )
+        if row_result is None:
+            return
+        next_nodes, next_edges, unused_created_elements = row_result
+        inner_nodes, inner_edges = next_nodes, next_edges
+        node_rows.append(inner_nodes)
     created_elements = element_list[first_new_element_index:]
 
     recompute_node_boundaries(node_list, boundary_list)
