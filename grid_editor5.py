@@ -974,6 +974,7 @@ class this_view(QGraphicsView):
         self.end_point   = None
         self.zoom_level  = 1.0
         self.selected_point = None
+        self.dragged_node = None
         self.current_patch = None
         self.current_extended_patch = None
         self.selected_edges = []
@@ -1301,7 +1302,8 @@ class this_view(QGraphicsView):
                     type(item) == type(node_list[0])
                     and getattr(item, "active", True)
                 ):
-                    item.mousePressEvent(event)
+                    self.dragged_node = item
+                    event.accept()
                     return
       
             self.start_point = event.pos()
@@ -1314,21 +1316,22 @@ class this_view(QGraphicsView):
             self.selected_point.move_to_scene(self.mapToScene(event.pos()))
             event.accept()
             return
+        if self.dragged_node is not None:
+            self.dragged_node.move_to_scene(self.mapToScene(event.pos()))
+            event.accept()
+            return
         if self.rubberBand and self.start_point: 
            self.rubberBand.setGeometry(QRect(self.start_point, event.pos()))
            self.end_point = event.pos()
            return
-        items = self.items(event.pos())
-        for item in items:
-            if (
-                type(item) == type(node_list[0])
-                and getattr(item, "active", True)
-            ):
-                item.mouseMoveEvent(event)
-    
+
     def mouseReleaseEvent(self, event):
         if self.selected_point:
             self.selected_point = None
+            event.accept()
+            return
+        if self.dragged_node is not None:
+            self.dragged_node = None
             event.accept()
             return
         modifiers = QApplication.keyboardModifiers()
@@ -2373,6 +2376,8 @@ def deactivate_node(node):
     """Keep an unused node scene-owned but make all of its graphics inactive."""
     active_view = globals().get("view")
     if active_view is not None:
+        if getattr(active_view, "dragged_node", None) is node:
+            active_view.dragged_node = None
         active_view.selected_nodes = [
             selected
             for selected in (getattr(active_view, "selected_nodes", None) or [])
@@ -2852,7 +2857,7 @@ class jorek_node_item(QGraphicsItem):
         if self.scene() and self.scene().views():
             zoom_level = self.scene().views()[0].zoom_level
 
-        node_radius = 25.0 / zoom_level
+        node_radius = 8.0 / zoom_level
         handle_radius = 8.0 / zoom_level
         pen_margin = 6.0 / zoom_level
         blue_endpoint = self.position + qt_point(self.xx[:, 1])
@@ -2897,15 +2902,20 @@ class jorek_node_item(QGraphicsItem):
         scene = self.scene()
         if scene is None or not scene.views():
             return
+        self.move_to_scene(scene.views()[0].mapToScene(event.pos()))
+        event.accept()
+
+    def move_to_scene(self, scene_position):
+        if not getattr(self, "active", True):
+            return
         self.prepareGeometryChange()
-        self.position = scene.views()[0].mapToScene(event.pos())
+        self.position = scene_position
         self.ellipse_item.setPos(self.position.x(), self.position.y())
         jorek.nodes_xx[0,0,self.index] = self.position.x() / this_scaling
         jorek.nodes_xx[1,0,self.index] = self.position.y() / this_scaling
         self.blue_handle.sync_position()
         self.red_handle.sync_position()
         self.update_connected_items()
-        event.accept()
 
     def update_connected_items(self, basis_index=None):
         if self.scene() is not None:
@@ -2930,7 +2940,8 @@ class jorek_node_item(QGraphicsItem):
    #     self.prepareGeometryChange()
 
         zoom_level = scene.views()[0].zoom_level 
-        self.ellipse_size = 50. / zoom_level
+        marker_size = 16. / zoom_level
+        self.ellipse_size = marker_size
         self.ellipse_item.setRect(self.position.x()-self.ellipse_size/2, self.position.y()-self.ellipse_size/2,
                                   self.ellipse_size, self.ellipse_size)
 

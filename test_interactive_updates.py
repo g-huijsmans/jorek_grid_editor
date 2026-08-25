@@ -25,6 +25,61 @@ class UpdateRecorder:
         self.update_count += 1
 
 
+def test_node_drag_keeps_press_target_when_nodes_overlap(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    nodes_xx = np.zeros((2, 4, 2))
+    nodes_xx[:, 0, 1] = [100.0, 0.0]
+    nodes = [
+        jorek_node_item(index, nodes_xx[:, :, index], 0)
+        for index in range(2)
+    ]
+    for node in nodes:
+        scene.addItem(node)
+    monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx), raising=False
+    )
+    monkeypatch.setattr(grid_editor5, "this_scaling", 1.0, raising=False)
+    monkeypatch.setattr(
+        grid_editor5.QApplication, "keyboardModifiers", lambda: Qt.NoModifier
+    )
+
+    press_position = QPoint(10, 10)
+    press_event = SimpleNamespace(
+        pos=lambda: press_position,
+        accept=lambda: None,
+    )
+    monkeypatch.setattr(view, "items", lambda position: [nodes[0]])
+    view.mousePressEvent(press_event)
+    assert view.dragged_node is nodes[0]
+    assert view.rubberBand is None
+
+    move_position = QPoint(100, 50)
+    expected_position = view.mapToScene(move_position)
+    original_second_position = QPointF(nodes[1].position)
+    monkeypatch.setattr(
+        view,
+        "items",
+        lambda position: pytest.fail("node drag must not repeat hit-testing"),
+    )
+    move_event = SimpleNamespace(
+        pos=lambda: move_position,
+        accept=lambda: None,
+    )
+    view.mouseMoveEvent(move_event)
+
+    assert nodes[0].position == expected_position
+    assert nodes[1].position == original_second_position
+
+    release_event = SimpleNamespace(accept=lambda: None)
+    view.mouseReleaseEvent(release_event)
+    assert view.dragged_node is None
+    assert app is not None
+
+
 def test_resize_fits_only_active_grid_with_uniform_transform(monkeypatch):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
