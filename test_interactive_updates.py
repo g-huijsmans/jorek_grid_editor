@@ -1957,13 +1957,13 @@ def test_capped_two_element_gap_reuses_sequential_single_element_helpers(
     real_two_edges = grid_editor5.add_element_from_two_edges
     real_three_edges = grid_editor5.add_element_from_three_edges
 
-    def record_two_edges(*args):
-        element = real_two_edges(*args)
+    def record_two_edges(*args, **kwargs):
+        element = real_two_edges(*args, **kwargs)
         helper_calls.append(("two", element))
         return element
 
-    def record_three_edges(*args):
-        element = real_three_edges(*args)
+    def record_three_edges(*args, **kwargs):
+        element = real_three_edges(*args, **kwargs)
         helper_calls.append(("three", element))
         return element
 
@@ -2000,7 +2000,8 @@ def test_capped_two_element_gap_reuses_sequential_single_element_helpers(
 
 
 def build_two_cap_selection(
-    monkeypatch, radial_layers, main_edge_count=3, end_radial_layers=None
+    monkeypatch, radial_layers, main_edge_count=3, end_radial_layers=None,
+    main_uv_index=1,
 ):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
@@ -2008,6 +2009,7 @@ def build_two_cap_selection(
     view.setScene(scene)
     if end_radial_layers is None:
         end_radial_layers = radial_layers
+    radial_uv_index = main_uv_index % 2 + 1
     positions = [
         (float(column), 0.0) for column in range(main_edge_count + 1)
     ]
@@ -2023,8 +2025,8 @@ def build_two_cap_selection(
     nodes_xx = np.zeros((2, 4, len(positions)))
     for index, position in enumerate(positions):
         nodes_xx[:, 0, index] = position
-        nodes_xx[:, 1, index] = [1.0 / 3.0, 0.0]
-        nodes_xx[:, 2, index] = [0.0, 1.0 / 3.0]
+        nodes_xx[:, main_uv_index, index] = [1.0 / 3.0, 0.0]
+        nodes_xx[:, radial_uv_index, index] = [0.0, 1.0 / 3.0]
     nodes = [
         jorek_node_item(index, nodes_xx[:, :, index], 2)
         for index in range(len(positions))
@@ -2049,15 +2051,21 @@ def build_two_cap_selection(
         return result
 
     main_edges = [
-        edge(column, column + 1, 1, 10 + column)
+        edge(column, column + 1, main_uv_index, 10 + column)
         for column in range(main_edge_count)
     ]
     start_cap_edges = [
-        edge(start_indices[index], start_indices[index + 1], 2, 30 + index)
+        edge(
+            start_indices[index], start_indices[index + 1],
+            radial_uv_index, 30 + index,
+        )
         for index in range(radial_layers)
     ]
     end_cap_edges = [
-        edge(end_indices[index], end_indices[index + 1], 2, 40 + index)
+        edge(
+            end_indices[index], end_indices[index + 1],
+            radial_uv_index, 40 + index,
+        )
         for index in range(end_radial_layers)
     ]
     selected_edges = list(reversed(
@@ -2073,12 +2081,15 @@ def build_two_cap_selection(
         end_cap_edges=end_cap_edges, selected_edges=selected_edges,
         start_nodes=[nodes[index] for index in start_indices],
         end_nodes=[nodes[index] for index in end_indices],
+        main_uv_index=main_uv_index,
     )
 
 
 def create_two_cap_patch(case):
     case.view.keyPressEvent(
-        type("KeyEvent", (), {"key": lambda self: Qt.Key_1})()
+        type("KeyEvent", (), {
+            "key": lambda self: Qt.Key_0 + case.main_uv_index
+        })()
     )
     case.view.keyPressEvent(
         type("KeyEvent", (), {"key": lambda self: Qt.Key_E})()
@@ -2254,16 +2265,173 @@ def test_multi_layer_two_cap_validation_is_atomic(
     assert "Two-cap" in capsys.readouterr().out
 
 
-def test_multi_layer_two_cap_bezier_guard_precedes_mesh_mutation(
+@pytest.mark.parametrize(
+    "radial_layers, main_edge_count, main_uv_index",
+    [(1, 3, 1), (2, 3, 1), (4, 3, 2), (2, 1, 2)],
+)
+def test_multi_layer_two_cap_bezier_commit_preserves_final_curve(
+    monkeypatch, capsys, radial_layers, main_edge_count, main_uv_index
+):
+    case = build_two_cap_selection(
+        monkeypatch, radial_layers, main_edge_count=main_edge_count,
+        main_uv_index=main_uv_index,
+    )
+    patch = create_two_cap_patch(case)
+    fixed_start = case.start_nodes[-1]
+    fixed_end = case.end_nodes[-1]
+    fixed_start.xx[:, main_uv_index] = [0.45, 0.25]
+    fixed_end.xx[:, main_uv_index] = [0.4, -0.2]
+    grid_editor5.jorek.nodes_xx[:, main_uv_index, fixed_start.index] = (
+        fixed_start.xx[:, main_uv_index]
+    )
+    grid_editor5.jorek.nodes_xx[:, main_uv_index, fixed_end.index] = (
+        fixed_end.xx[:, main_uv_index]
+    )
+    (
+        fixed_start.blue_handle if main_uv_index == 1
+        else fixed_start.red_handle
+    ).sync_position()
+    (
+        fixed_end.blue_handle if main_uv_index == 1
+        else fixed_end.red_handle
+    ).sync_position()
+    patch.enable_bezier_mode()
+
+    preview_positions = [
+        grid_editor5.np_point(node.position) for node in patch.outer_nodes
+    ]
+    tangents = [np.array(tangent, copy=True) for tangent in patch.outer_tangents]
+    parameters = np.array(patch.outer_parameters, copy=True)
+    scales = grid_editor5.bezier_nodal_parameter_scales(parameters)
+    cap_snapshots = [
+        (
+            node, grid_editor5.np_point(node.position),
+            np.array(node.xx, copy=True), QPointF(node.blue_handle.pos()),
+            QPointF(node.red_handle.pos()),
+        )
+        for node in case.start_nodes + case.end_nodes
+    ]
+    original_node_count = len(grid_editor5.node_list)
+
+    commit_result = {}
+    real_commit = grid_editor5.add_extended_patch_to_nodes_elements
+
+    def capture_commit(committed_patch):
+        commit_result["value"] = real_commit(committed_patch)
+        return commit_result["value"]
+
+    monkeypatch.setattr(
+        grid_editor5, "add_extended_patch_to_nodes_elements", capture_commit
+    )
+    case.view.keyPressEvent(
+        type("KeyEvent", (), {"key": lambda self: Qt.Key_P})()
+    )
+    node_rows, elements = commit_result["value"]
+    capsys.readouterr()
+
+    assert len(elements) == main_edge_count * radial_layers
+    assert len(grid_editor5.node_list) == (
+        original_node_count + (main_edge_count - 1) * radial_layers
+    )
+    assert len(node_rows) == radial_layers + 1
+    for radial_index, row in enumerate(node_rows):
+        assert row[0] is case.start_nodes[radial_index]
+        assert row[-1] is case.end_nodes[radial_index]
+    for node, position, xx, blue_position, red_position in cap_snapshots:
+        assert np.array_equal(grid_editor5.np_point(node.position), position)
+        assert np.array_equal(node.xx, xx)
+        assert node.blue_handle.pos() == blue_position
+        assert node.red_handle.pos() == red_position
+        assert_basis_handles_match_vectors(node)
+    assert all(
+        np.allclose(grid_editor5.np_point(node.position), preview_position)
+        for node, preview_position in zip(node_rows[-1], preview_positions)
+    )
+    assert all(
+        sum(
+            np.allclose(
+                grid_editor5.np_point(candidate.position),
+                grid_editor5.np_point(cap_node.position),
+            )
+            for candidate in grid_editor5.node_list
+        ) == 1
+        for cap_node in case.start_nodes + case.end_nodes
+    )
+
+    for index, node in enumerate(node_rows[-1][1:-1], start=1):
+        assert np.allclose(
+            node.xx[:, main_uv_index], scales[index] * tangents[index] / 3.0
+        )
+        assert np.dot(node.xx[:, main_uv_index], tangents[index]) > 0.0
+        assert_basis_handles_match_vectors(node)
+
+    created_edges = {edge for element in elements for edge in element.edges}
+    for row_index in range(1, radial_layers + 1):
+        for index in range(main_edge_count):
+            parameter_start_node = node_rows[row_index][index]
+            parameter_end_node = node_rows[row_index][index + 1]
+            edge = next(
+                edge for edge in created_edges
+                if frozenset(edge.vertices) == frozenset((
+                    parameter_start_node.index, parameter_end_node.index,
+                ))
+            )
+            if row_index < radial_layers:
+                assert np.allclose(np.abs(edge.sizes[1, :]), 1.0)
+                continue
+
+            dt = parameters[index + 1] - parameters[index]
+            intended_by_node = {
+                parameter_start_node: dt * tangents[index] / 3.0,
+                parameter_end_node: -dt * tangents[index + 1] / 3.0,
+            }
+            for endpoint, node in enumerate(edge.nodes):
+                assert np.allclose(
+                    node.xx[:, main_uv_index] * edge.sizes[1, endpoint],
+                    intended_by_node[node], atol=1.e-10,
+                )
+
+            controls = edge_bezier_points(edge.points)
+            controls = np.column_stack((
+                controls[:, 0, 0], controls[:, 1, 0],
+                controls[:, 1, 1], controls[:, 0, 1],
+            ))
+            if edge.nodes[0] is not parameter_start_node:
+                controls = controls[:, ::-1]
+            expected_controls = np.column_stack((
+                preview_positions[index],
+                preview_positions[index] + dt * tangents[index] / 3.0,
+                preview_positions[index + 1]
+                - dt * tangents[index + 1] / 3.0,
+                preview_positions[index + 1],
+            ))
+            assert np.allclose(controls, expected_controls, atol=1.e-10)
+            if index == 0:
+                assert np.dot(
+                    3.0 * (controls[:, 1] - controls[:, 0]), tangents[0]
+                ) > 0.0
+            if index == main_edge_count - 1:
+                assert np.dot(
+                    3.0 * (controls[:, 3] - controls[:, 2]), tangents[-1]
+                ) > 0.0
+
+    assert case.view.current_extended_patch is None
+    assert patch.scene() is None
+
+
+def test_two_cap_bezier_fixed_endpoint_validation_is_atomic(
     monkeypatch, capsys
 ):
     case = build_two_cap_selection(monkeypatch, 2, main_edge_count=3)
     patch = create_two_cap_patch(case)
-    patch.bezier_mode = True
+    patch.enable_bezier_mode()
+    case.start_nodes[-1].xx[:, patch.main_uv_index()] = 0.0
+    grid_editor5.jorek.nodes_xx[
+        :, patch.main_uv_index(), case.start_nodes[-1].index
+    ] = 0.0
     node_snapshot = list(grid_editor5.node_list)
     element_snapshot = list(grid_editor5.element_list)
     boundary_snapshot = list(grid_editor5.boundary_list)
-    active_snapshot = [edge.active for edge in boundary_snapshot]
 
     result = grid_editor5.add_extended_patch_to_nodes_elements(patch)
 
@@ -2271,11 +2439,7 @@ def test_multi_layer_two_cap_bezier_guard_precedes_mesh_mutation(
     assert grid_editor5.node_list == node_snapshot
     assert grid_editor5.element_list == element_snapshot
     assert grid_editor5.boundary_list == boundary_snapshot
-    assert [edge.active for edge in boundary_snapshot] == active_snapshot
-    assert (
-        "Multi-layer two-cap Bézier commit is not implemented yet"
-        in capsys.readouterr().out
-    )
+    assert "must be nonzero" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("cap_at_start", [True, False])

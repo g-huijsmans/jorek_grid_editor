@@ -1681,6 +1681,7 @@ class single_element_patch_data:
         radial_reference_node=None, radial_columns=None,
         along_tangents=None, along_tangent=None, along_parameter_interval=None,
         along_edge_index=None, along_parameters=None, fixed_bezier_nodes=None,
+        parameter_start_node=None, parameter_end_node=None,
     ):
         self.edges = list(edges)
         self.corner_nodes = list(corner_nodes)
@@ -1693,6 +1694,8 @@ class single_element_patch_data:
         self.along_edge_index = along_edge_index
         self.along_parameters = along_parameters
         self.fixed_bezier_nodes = list(fixed_bezier_nodes or [])
+        self.parameter_start_node = parameter_start_node
+        self.parameter_end_node = parameter_end_node
 
 
 def preview_node(point_or_node):
@@ -1741,8 +1744,26 @@ def add_element_from_two_edges(
     return element_list[-1] if len(element_list) > element_count else None
 
 
-def add_element_from_three_edges(edge0, edge1, edge2):
-    patch = single_element_patch_data([edge0, edge1, edge2], [])
+def add_element_from_three_edges(
+    edge0, edge1, edge2, along_tangents=None, along_parameters=None,
+    along_edge_index=None, parameter_start_node=None,
+    parameter_end_node=None, fixed_bezier_nodes=None,
+):
+    along_parameter_interval = (
+        along_parameters[along_edge_index + 1]
+        - along_parameters[along_edge_index]
+        if along_parameters is not None else None
+    )
+    patch = single_element_patch_data(
+        [edge0, edge1, edge2], [],
+        along_tangents=along_tangents,
+        along_parameter_interval=along_parameter_interval,
+        along_edge_index=along_edge_index,
+        along_parameters=along_parameters,
+        fixed_bezier_nodes=fixed_bezier_nodes,
+        parameter_start_node=parameter_start_node,
+        parameter_end_node=parameter_end_node,
+    )
     element_count = len(element_list)
     _add_single_element_patch_to_nodes_elements(patch)
     return element_list[-1] if len(element_list) > element_count else None
@@ -1964,7 +1985,7 @@ def two_cap_topology_error(topology, ordered_nodes):
 def add_two_cap_extended_row(
     inner_nodes, inner_edges, target_positions,
     start_cap_edge, end_cap_edge, fixed_start_node, fixed_end_node,
-    reference_inner_nodes=None,
+    reference_inner_nodes=None, along_tangents=None, along_parameters=None,
 ):
     """Create one radial row whose two endpoints are existing cap nodes."""
     if len(inner_nodes) != len(inner_edges) + 1:
@@ -1991,13 +2012,33 @@ def add_two_cap_extended_row(
         len(reference_inner_nodes) != len(inner_nodes)
     ):
         raise ValueError("Two-cap radial reference row has the wrong node count")
+    if (along_tangents is None) != (along_parameters is None):
+        raise ValueError("Two-cap Bezier tangents and parameters must be paired")
+    if along_parameters is not None:
+        if (
+            len(along_parameters) != len(inner_nodes)
+            or len(along_tangents) != len(inner_nodes)
+        ):
+            raise ValueError("Two-cap Bezier samples have the wrong count")
+        bezier_nodal_parameter_scales(along_parameters)
 
     first_new_node_index = len(node_list)
     first_new_element_index = len(element_list)
     next_nodes = [fixed_start_node]
     if len(inner_edges) == 1:
+        bezier_kwargs = {}
+        if along_parameters is not None:
+            bezier_kwargs = {
+                "along_tangents": along_tangents,
+                "along_parameters": along_parameters,
+                "along_edge_index": 0,
+                "parameter_start_node": fixed_start_node,
+                "parameter_end_node": fixed_end_node,
+                "fixed_bezier_nodes": [fixed_start_node, fixed_end_node],
+            }
         if add_element_from_three_edges(
-            inner_edges[0], start_cap_edge, end_cap_edge
+            inner_edges[0], start_cap_edge, end_cap_edge,
+            **bezier_kwargs
         ) is None:
             return None
     else:
@@ -2010,10 +2051,25 @@ def add_two_cap_extended_row(
                     "radial_reference_node": reference_inner_nodes[column + 1],
                     "radial_column": column + 1,
                 }
+            bezier_kwargs = {}
+            if along_parameters is not None:
+                bezier_kwargs = {
+                    "along_tangent": along_tangents[column + 1],
+                    "along_tangents": along_tangents,
+                    "along_parameter_interval": (
+                        along_parameters[column + 1]
+                        - along_parameters[column]
+                    ),
+                    "along_edge_index": column,
+                    "along_parameters": along_parameters,
+                    "fixed_bezier_nodes": (
+                        [fixed_start_node] if column == 0 else None
+                    ),
+                }
             if add_element_from_two_edges(
                 inner_edges[column], transverse_edge,
                 target_positions[column + 1],
-                **radial_kwargs
+                **radial_kwargs, **bezier_kwargs
             ) is None:
                 return None
             if len(node_list) != old_node_count + 1:
@@ -2033,8 +2089,19 @@ def add_two_cap_extended_row(
                 inner_nodes[column + 1], next_node
             )
         old_node_count = len(node_list)
+        bezier_kwargs = {}
+        if along_parameters is not None:
+            bezier_kwargs = {
+                "along_tangents": along_tangents,
+                "along_parameters": along_parameters,
+                "along_edge_index": len(inner_edges) - 1,
+                "parameter_start_node": next_nodes[-1],
+                "parameter_end_node": fixed_end_node,
+                "fixed_bezier_nodes": [fixed_end_node],
+            }
         if add_element_from_three_edges(
-            inner_edges[-1], transverse_edge, end_cap_edge
+            inner_edges[-1], transverse_edge, end_cap_edge,
+            **bezier_kwargs
         ) is None:
             return None
         if len(node_list) != old_node_count:
@@ -2089,9 +2156,38 @@ def add_capped_gap_to_nodes_elements(patch):
         if row[-1] is not end_cap_nodes[radial_index]:
             print("Two-cap preview row does not reuse its end cap node")
             return
-    if patch.bezier_mode and patch.radial_layers > 1:
-        print("Multi-layer two-cap Bézier commit is not implemented yet")
-        return
+    working_tangents = working_parameters = None
+    if patch.bezier_mode:
+        working_tangents = [
+            np.asarray(tangent, dtype=float)
+            for tangent in patch.outer_tangents
+        ]
+        working_parameters = np.asarray(
+            patch.outer_parameters, dtype=float
+        )
+        try:
+            if (
+                len(working_parameters) != patch.required_outer_node_count
+                or len(working_tangents) != patch.required_outer_node_count
+            ):
+                raise ValueError(
+                    "Two-cap Bezier samples do not match the outer nodes"
+                )
+            bezier_nodal_parameter_scales(working_parameters)
+            main_uv_index = patch.main_uv_index()
+            basis_size_for_effective_vector(
+                start_cap_nodes[-1].xx[:, main_uv_index],
+                (working_parameters[1] - working_parameters[0])
+                * working_tangents[0] / 3.,
+            )
+            basis_size_for_effective_vector(
+                end_cap_nodes[-1].xx[:, main_uv_index],
+                -(working_parameters[-1] - working_parameters[-2])
+                * working_tangents[-1] / 3.,
+            )
+        except ValueError as error:
+            print(error)
+            return
 
     inner_nodes = list(patch.ordered_nodes)
     inner_edges = list(patch.ordered_edges)
@@ -2113,6 +2209,14 @@ def add_capped_gap_to_nodes_elements(patch):
             end_cap_nodes[radial_index + 1],
             reference_inner_nodes=(
                 reference_inner_nodes if patch.radial_layers > 1 else None
+            ),
+            along_tangents=(
+                working_tangents
+                if radial_index == patch.radial_layers - 1 else None
+            ),
+            along_parameters=(
+                working_parameters
+                if radial_index == patch.radial_layers - 1 else None
             ),
         )
         if row_result is None:
@@ -2380,21 +2484,44 @@ def _add_single_element_patch_to_nodes_elements(patch):
         edge_vertices = [edge_nodes[0].index, edge_nodes[1].index]
         edge_uv_index = ordered_edges[1].uv_index
 
-        edge_sizes = np.zeros((2,2))
-        edge_sizes[0,:] = 1.
-        edge_sizes[1,0] = np.sign(np.inner(
-            np_point(edge_nodes[1].position - edge_nodes[0].position),
-            edge_nodes[0].xx[:,edge_uv_index],
-        ))
-        edge_sizes[1,1] = np.sign(np.inner(
-            np_point(edge_nodes[0].position - edge_nodes[1].position),
-            edge_nodes[1].xx[:,edge_uv_index],
-        ))
+        if patch.along_parameter_interval is not None:
+            if (
+                patch.parameter_start_node is None
+                or patch.parameter_end_node is None
+            ):
+                raise ValueError(
+                    "Bezier three-edge closure requires parameter endpoints"
+                )
+            along_nodal_scales = bezier_nodal_parameter_scales(
+                patch.along_parameters
+            )
+            index = patch.along_edge_index
+            edge_sizes = prescribed_bezier_outer_edge_sizes(
+                edge_nodes,
+                patch.parameter_start_node,
+                patch.parameter_end_node,
+                patch.along_parameter_interval,
+                along_nodal_scales[index],
+                along_nodal_scales[index + 1],
+            )
+            edge_sizes = override_fixed_bezier_endpoint_sizes(
+                edge_sizes, edge_nodes,
+                patch.parameter_start_node,
+                patch.parameter_end_node,
+                patch.along_parameter_interval,
+                patch.along_tangents[index],
+                patch.along_tangents[index + 1],
+                edge_uv_index, patch.fixed_bezier_nodes,
+            )
+        else:
+            edge_sizes = signed_edge_sizes(edge_nodes, edge_uv_index)
 
         missing_edge = boundary_edge(
             edge_nodes, edge_vertices, [], None, None,
             edge_uv_index, edge_sizes,
         )
+        if patch.along_parameter_interval is not None:
+            print_bezier_outer_edge_diagnostic(missing_edge, patch)
         scene.addItem(missing_edge)
         patch.edges = ordered_edges + [missing_edge]
         add_element_from_edges(
