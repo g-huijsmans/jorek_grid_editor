@@ -18,6 +18,10 @@ from jorek_geometry    import (
 
 
 NODE_MARKER_SIZE = 16.0
+Z_MESH_EDGE = 0.0
+Z_PATCH_PREVIEW = 1.0
+Z_NODE = 2.0
+Z_VECTOR_HANDLE = 4.0
 
 
 def validate_single_element_patch(selected_edges):
@@ -583,7 +587,7 @@ class extended_bezier_handle(QGraphicsEllipseItem):
         self.setPos(position)
         self.setBrush(QBrush(color))
         self.setPen(QPen(Qt.black, 1.))
-        self.setZValue(2.)
+        self.setZValue(Z_VECTOR_HANDLE)
 
     def move_to_scene(self, scene_position):
         new_position = self.patch.mapFromScene(scene_position)
@@ -602,6 +606,7 @@ class extended_bezier_handle(QGraphicsEllipseItem):
 class extended_patch(QGraphicsPathItem):
     def __init__(self, ordered_nodes, ordered_edges, can_commit=True):
         super().__init__()
+        self.setZValue(Z_PATCH_PREVIEW)
         self.ordered_nodes = ordered_nodes
         self.ordered_edges = ordered_edges
         self.outer_nodes = []
@@ -1428,6 +1433,7 @@ class big_patch_node(QGraphicsItem):
 class big_patch(QGraphicsPathItem):
     def __init__(self):
         super().__init__()
+        self.setZValue(Z_PATCH_PREVIEW)
         print("big_patch : init")
         
         self.corner_nodes = []
@@ -1574,6 +1580,47 @@ def prescribed_bezier_outer_edge_sizes(
     return edge_sizes
 
 
+def basis_size_for_effective_vector(stored_basis, effective_vector):
+    """Return the scalar that makes a stored basis equal an effective vector."""
+    stored_basis = np.asarray(stored_basis, dtype=float)
+    effective_vector = np.asarray(effective_vector, dtype=float)
+    basis_norm_squared = np.inner(stored_basis, stored_basis)
+    if not np.isfinite(basis_norm_squared) or basis_norm_squared <= 0.0:
+        raise ValueError("Bezier fixed-node basis vector must be nonzero")
+    size = np.inner(stored_basis, effective_vector) / basis_norm_squared
+    if (
+        not np.isfinite(size)
+        or not np.allclose(
+            stored_basis * size, effective_vector, rtol=1.e-9, atol=1.e-12
+        )
+    ):
+        raise ValueError(
+            "Bezier fixed-node basis vector is not collinear with the tangent"
+        )
+    return size
+
+
+def override_fixed_bezier_endpoint_sizes(
+    edge_sizes, edge_nodes, parameter_start_node, parameter_end_node,
+    parameter_interval, start_tangent, end_tangent, uv_index, fixed_nodes,
+):
+    """Use each fixed node's actual stored basis for its endpoint multiplier."""
+    intended_by_node = {
+        parameter_start_node: parameter_interval * np.asarray(start_tangent) / 3.,
+        parameter_end_node: -parameter_interval * np.asarray(end_tangent) / 3.,
+    }
+    for fixed_node in fixed_nodes or []:
+        if fixed_node not in intended_by_node:
+            raise ValueError("Bezier fixed node is not an edge endpoint")
+        endpoint = next(
+            index for index, node in enumerate(edge_nodes) if node is fixed_node
+        )
+        edge_sizes[1, endpoint] = basis_size_for_effective_vector(
+            fixed_node.xx[:, uv_index], intended_by_node[fixed_node]
+        )
+    return edge_sizes
+
+
 def print_bezier_outer_edge_diagnostic(edge, patch):
     index = patch.along_edge_index
     parameter_interval = (
@@ -1633,7 +1680,7 @@ class single_element_patch_data:
         self, edges, corner_nodes, radial_reference_nodes=None,
         radial_reference_node=None, radial_columns=None,
         along_tangents=None, along_tangent=None, along_parameter_interval=None,
-        along_edge_index=None, along_parameters=None,
+        along_edge_index=None, along_parameters=None, fixed_bezier_nodes=None,
     ):
         self.edges = list(edges)
         self.corner_nodes = list(corner_nodes)
@@ -1645,6 +1692,7 @@ class single_element_patch_data:
         self.along_parameter_interval = along_parameter_interval
         self.along_edge_index = along_edge_index
         self.along_parameters = along_parameters
+        self.fixed_bezier_nodes = list(fixed_bezier_nodes or [])
 
 
 def preview_node(point_or_node):
@@ -1675,7 +1723,7 @@ def add_element_from_one_edge(
 def add_element_from_two_edges(
     edge0, edge1, point, radial_reference_node=None, radial_column=None,
     along_tangent=None, along_tangents=None, along_parameter_interval=None,
-    along_edge_index=None, along_parameters=None,
+    along_edge_index=None, along_parameters=None, fixed_bezier_nodes=None,
 ):
     patch = single_element_patch_data(
         [edge0, edge1], [preview_node(point)],
@@ -1686,6 +1734,7 @@ def add_element_from_two_edges(
         along_parameter_interval=along_parameter_interval,
         along_edge_index=along_edge_index,
         along_parameters=along_parameters,
+        fixed_bezier_nodes=fixed_bezier_nodes,
     )
     element_count = len(element_list)
     _add_single_element_patch_to_nodes_elements(patch)
@@ -2099,9 +2148,22 @@ def cap_first_rows(topology, preview_node_rows):
     )
 
 
+def cap_first_bezier_data(patch, topology):
+    """Return strictly increasing Bezier samples in cap-first row order."""
+    parameters = np.asarray(patch.outer_parameters, dtype=float)
+    tangents = [np.asarray(tangent, dtype=float) for tangent in patch.outer_tangents]
+    if len(parameters) != len(patch.outer_nodes) or len(tangents) != len(parameters):
+        raise ValueError("One-cap Bezier samples do not match the outer nodes")
+    if not topology.start_cap_edges:
+        parameters = 1.0 - parameters[::-1]
+        tangents = [-tangent for tangent in reversed(tangents)]
+    bezier_nodal_parameter_scales(parameters)
+    return tangents, parameters
+
+
 def add_one_cap_extended_row(
     inner_nodes, inner_edges, target_positions, cap_edge, fixed_outer_node,
-    reference_inner_nodes=None,
+    reference_inner_nodes=None, along_tangents=None, along_parameters=None,
 ):
     """Create one cap-first radial row without duplicating its fixed node."""
     if len(inner_nodes) != len(inner_edges) + 1:
@@ -2124,6 +2186,15 @@ def add_one_cap_extended_row(
         len(reference_inner_nodes) != len(inner_nodes)
     ):
         raise ValueError("One-cap radial reference row has the wrong node count")
+    if (along_tangents is None) != (along_parameters is None):
+        raise ValueError("One-cap Bezier tangents and parameters must be paired")
+    if along_parameters is not None:
+        if (
+            len(along_parameters) != len(inner_nodes)
+            or len(along_tangents) != len(inner_nodes)
+        ):
+            raise ValueError("One-cap Bezier samples have the wrong count")
+        bezier_nodal_parameter_scales(along_parameters)
 
     first_new_node_index = len(node_list)
     first_new_element_index = len(element_list)
@@ -2137,6 +2208,21 @@ def add_one_cap_extended_row(
             ),
             radial_column=(
                 index + 1 if reference_inner_nodes is not None else None
+            ),
+            along_tangent=(
+                along_tangents[index + 1]
+                if along_tangents is not None else None
+            ),
+            along_tangents=along_tangents,
+            along_parameter_interval=(
+                along_parameters[index + 1] - along_parameters[index]
+                if along_parameters is not None else None
+            ),
+            along_edge_index=(index if along_parameters is not None else None),
+            along_parameters=along_parameters,
+            fixed_bezier_nodes=(
+                [fixed_outer_node]
+                if along_parameters is not None and index == 0 else None
             ),
         ) is None:
             return None
@@ -2184,9 +2270,6 @@ def add_one_cap_gap_to_nodes_elements(patch):
     cap_nodes = list(
         topology.start_cap_nodes if start_cap_edges else topology.end_cap_nodes
     )
-    if patch.bezier_mode and len(cap_edges) > 1:
-        print("Multi-layer one-cap Bézier commit is not implemented yet")
-        return
     if len(cap_edges) != patch.radial_layers:
         print("One-cap edge count does not match radial layer count")
         return
@@ -2208,6 +2291,20 @@ def add_one_cap_gap_to_nodes_elements(patch):
     ) = cap_first_rows(
         topology, patch.preview_node_rows
     )
+    working_tangents = working_parameters = None
+    if patch.bezier_mode:
+        try:
+            working_tangents, working_parameters = cap_first_bezier_data(
+                patch, topology
+            )
+            basis_size_for_effective_vector(
+                cap_nodes[-1].xx[:, patch.main_uv_index()],
+                (working_parameters[1] - working_parameters[0])
+                * working_tangents[0] / 3.,
+            )
+        except ValueError as error:
+            print(error)
+            return
     reference_inner_nodes = list(inner_nodes)
     for radial_index in range(patch.radial_layers):
         expected_cap_indices = frozenset((
@@ -2243,6 +2340,14 @@ def add_one_cap_gap_to_nodes_elements(patch):
             cap_edges[radial_index], cap_nodes[radial_index + 1],
             reference_inner_nodes=(
                 reference_inner_nodes if patch.radial_layers > 1 else None
+            ),
+            along_tangents=(
+                working_tangents
+                if radial_index == patch.radial_layers - 1 else None
+            ),
+            along_parameters=(
+                working_parameters
+                if radial_index == patch.radial_layers - 1 else None
             ),
         )
         if row_result is None:
@@ -2353,12 +2458,13 @@ def _add_single_element_patch_to_nodes_elements(patch):
         xx = xx / this_scaling
         jorek.nodes_xx = np.append(jorek.nodes_xx,xx,2)
         new_node       = jorek_node_item(new_node_index, this_scaling * xx[:,:,0], 2)
-        orient_new_node_red_vector(
-            new_node,
-            getattr(patch, "radial_reference_node", None),
-            (patch.radial_columns[0] if patch.radial_columns else None),
-            patch.edges[0].uv_index, perp_index_0,
-        )
+        if along_tangent is None or perp_index_0 == 2:
+            orient_new_node_red_vector(
+                new_node,
+                getattr(patch, "radial_reference_node", None),
+                (patch.radial_columns[0] if patch.radial_columns else None),
+                patch.edges[0].uv_index, perp_index_0,
+            )
         node_list.append(new_node)
         scene.addItem(new_node)
         new_node.update()
@@ -2384,6 +2490,13 @@ def _add_single_element_patch_to_nodes_elements(patch):
                 patch.along_parameter_interval,
                 along_nodal_scales[patch.along_edge_index],
                 along_nodal_scales[patch.along_edge_index + 1],
+            )
+            edge_sizes = override_fixed_bezier_endpoint_sizes(
+                edge_sizes, edge_nodes, outer_node1, new_node,
+                patch.along_parameter_interval,
+                patch.along_tangents[patch.along_edge_index],
+                patch.along_tangents[patch.along_edge_index + 1],
+                edge_uv_index, patch.fixed_bezier_nodes,
             )
         else:
             edge_sizes = signed_edge_sizes(edge_nodes, edge_uv_index)
@@ -2985,6 +3098,7 @@ def rebuild_node_connections():
 class boundary_edge(QGraphicsPathItem):
     def __init__(self, nodes, vertices, local_nodes_index, element_index, element_side, uv_index, element_sizes):
         super().__init__()
+        self.setZValue(Z_MESH_EDGE)
         self.active = True
         self.vertices          = vertices
         self.nodes             = nodes 
@@ -3035,6 +3149,7 @@ class boundary_edge(QGraphicsPathItem):
 class jorek_element_item(QGraphicsItem):
     def __init__(self, index, vertices, sizes):
         super().__init__()
+        self.setZValue(Z_MESH_EDGE)
         self.active = True
 
         self.index    = index
@@ -3143,7 +3258,7 @@ class basis_vector_handle(QGraphicsEllipseItem):
         self.basis_index = basis_index
         self.setBrush(QBrush(color))
         self.setPen(QPen(Qt.black, 1.0))
-        self.setZValue(1.0)
+        self.setZValue(Z_VECTOR_HANDLE)
         self.sync_position()
 
     def sync_position(self):
@@ -3173,6 +3288,7 @@ class basis_vector_handle(QGraphicsEllipseItem):
 class jorek_node_item(QGraphicsItem):
     def __init__(self, index, xx, boundary):
         super().__init__()
+        self.setZValue(Z_NODE)
 
         self.ellipse_size  = 30
         self.xx           = xx
