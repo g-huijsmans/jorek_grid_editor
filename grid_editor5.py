@@ -17,6 +17,9 @@ from jorek_geometry    import (
 )
 
 
+NODE_MARKER_SIZE = 16.0
+
+
 def validate_single_element_patch(selected_edges):
     if any(not getattr(edge, "active", True) for edge in selected_edges):
         return "Inactive boundary edges cannot define a patch"
@@ -1503,21 +1506,49 @@ def signed_edge_sizes(edge_nodes, uv_index):
     return edge_sizes
 
 
+def bezier_nodal_parameter_scales(parameters):
+    parameters = np.asarray(parameters, dtype=float)
+    if parameters.ndim != 1 or len(parameters) < 2:
+        raise ValueError("Bezier parameters must contain at least two values")
+    parameter_intervals = np.diff(parameters)
+    if (
+        not np.all(np.isfinite(parameter_intervals))
+        or np.any(parameter_intervals <= 0.0)
+    ):
+        raise ValueError("Bezier parameter intervals must be positive and nonzero")
+
+    scales = np.empty(len(parameters), dtype=float)
+    scales[0] = parameter_intervals[0]
+    scales[-1] = parameter_intervals[-1]
+    if len(parameters) > 2:
+        scales[1:-1] = 0.5 * (
+            parameter_intervals[:-1] + parameter_intervals[1:]
+        )
+    return scales
+
+
 def prescribed_bezier_outer_edge_sizes(
-    edge_nodes, parameter_start_node, parameter_end_node, parameter_interval
+    edge_nodes, parameter_start_node, parameter_end_node, parameter_interval,
+    parameter_start_scale, parameter_end_scale,
 ):
     """Use parameter ordering, never chord direction, for Bézier edge signs."""
+    if parameter_interval <= 0.0:
+        raise ValueError("Bezier parameter interval must be positive and nonzero")
+    if parameter_start_scale <= 0.0 or parameter_end_scale <= 0.0:
+        raise ValueError("Bezier nodal parameter scales must be positive and nonzero")
+    start_size = parameter_interval / parameter_start_scale
+    end_size = parameter_interval / parameter_end_scale
     edge_sizes = np.ones((2, 2))
     if (
         edge_nodes[0] is parameter_start_node
         and edge_nodes[1] is parameter_end_node
     ):
-        edge_sizes[1, :] = [parameter_interval, -parameter_interval]
+        edge_sizes[1, :] = [start_size, -end_size]
     elif (
         edge_nodes[0] is parameter_end_node
         and edge_nodes[1] is parameter_start_node
     ):
-        edge_sizes[1, :] = [-parameter_interval, parameter_interval]
+        edge_sizes[1, :] = [-end_size, start_size]
     else:
         raise ValueError("Bézier outer edge nodes do not match parameter order")
     return edge_sizes
@@ -1525,6 +1556,18 @@ def prescribed_bezier_outer_edge_sizes(
 
 def print_bezier_outer_edge_diagnostic(edge, patch):
     index = patch.along_edge_index
+    parameter_interval = (
+        patch.along_parameters[index + 1] - patch.along_parameters[index]
+    )
+    effective_vectors = [
+        node.xx[:, edge.uv_index] * edge.sizes[1, endpoint]
+        for endpoint, node in enumerate(edge.nodes)
+    ]
+    intended_vectors = [
+        parameter_interval * np.asarray(patch.along_tangents[index]) / 3.0,
+        -parameter_interval
+        * np.asarray(patch.along_tangents[index + 1]) / 3.0,
+    ]
     print(
         "Bezier outer edge",
         index,
@@ -1534,6 +1577,10 @@ def print_bezier_outer_edge_diagnostic(edge, patch):
         patch.along_parameters[index + 1],
         "sizes",
         edge.sizes[1, :],
+        "effective stored order",
+        effective_vectors,
+        "intended parameter order",
+        intended_vectors,
     )
 
 
@@ -1553,6 +1600,7 @@ def orient_new_node_red_vector(
     if dot_before < 0:
         new_node.xx[:, 2] *= -1.
         jorek.nodes_xx[:, 2, new_node.index] *= -1.
+        new_node.red_handle.sync_position()
     print("new red after =", new_node.xx[:, 2])
     print(
         "dot after =",
@@ -1606,13 +1654,14 @@ def add_element_from_one_edge(
 
 def add_element_from_two_edges(
     edge0, edge1, point, radial_reference_node=None, radial_column=None,
-    along_tangent=None, along_parameter_interval=None,
+    along_tangent=None, along_tangents=None, along_parameter_interval=None,
     along_edge_index=None, along_parameters=None,
 ):
     patch = single_element_patch_data(
         [edge0, edge1], [preview_node(point)],
         radial_reference_node=radial_reference_node,
         radial_columns=([radial_column] if radial_column is not None else None),
+        along_tangents=along_tangents,
         along_tangent=along_tangent,
         along_parameter_interval=along_parameter_interval,
         along_edge_index=along_edge_index,
@@ -1711,6 +1760,7 @@ def add_open_extended_row(
                 along_tangents[index + 1]
                 if along_tangents is not None else None
             ),
+            along_tangents=along_tangents,
             along_parameter_interval=(
                 along_parameters[index + 1] - along_parameters[index]
                 if along_parameters is not None else None
@@ -2010,8 +2060,16 @@ def _add_single_element_patch_to_nodes_elements(patch):
         xx[:,0,0]            = [patch.corner_nodes[0].position.x(),patch.corner_nodes[0].position.y()]
         xx[:,perp_index_0,0] = direction_0 / 3.
         along_tangent = getattr(patch, "along_tangent", None)
+        along_nodal_scales = (
+            bezier_nodal_parameter_scales(patch.along_parameters)
+            if along_tangent is not None else None
+        )
+        along_node_scale = (
+            along_nodal_scales[patch.along_edge_index + 1]
+            if along_nodal_scales is not None else 1.0
+        )
         xx[:,perp_index_1,0] = (
-            np.asarray(along_tangent) / 3.
+            along_node_scale * np.asarray(along_tangent) / 3.
             if along_tangent is not None else direction_1 / 3.
         )
         xx[:,3,0]            = [0.,0.]
@@ -2048,6 +2106,8 @@ def _add_single_element_patch_to_nodes_elements(patch):
             edge_sizes = prescribed_bezier_outer_edge_sizes(
                 edge_nodes, outer_node1, new_node,
                 patch.along_parameter_interval,
+                along_nodal_scales[patch.along_edge_index],
+                along_nodal_scales[patch.along_edge_index + 1],
             )
         else:
             edge_sizes = signed_edge_sizes(edge_nodes, edge_uv_index)
@@ -2094,6 +2154,10 @@ def _add_single_element_patch_to_nodes_elements(patch):
             patch, "radial_reference_nodes", None
         )
         along_tangents = getattr(patch, "along_tangents", None)
+        along_nodal_scales = (
+            bezier_nodal_parameter_scales(patch.along_parameters)
+            if along_tangents is not None else None
+        )
         radial_columns = getattr(patch, "radial_columns", None)
         reference_at_node1 = reference_at_node0 = None
         column_at_node1 = column_at_node0 = None
@@ -2124,7 +2188,9 @@ def _add_single_element_patch_to_nodes_elements(patch):
         xx         = np.zeros((2,4,1))
         xx[:,0,0] = new_at_node1_position
         xx[:,uv_index,0] = (
-            np.asarray(tangent_at_node1) / 3.
+            along_nodal_scales[
+                patch.along_edge_index + node1_match
+            ] * np.asarray(tangent_at_node1) / 3.
             if tangent_at_node1 is not None
             else direction_to_new_at_node0 / 3.
         )
@@ -2156,7 +2222,9 @@ def _add_single_element_patch_to_nodes_elements(patch):
         xx         = np.zeros((2,4,1))
         xx[:,0,0] = new_at_node0_position
         xx[:,uv_index,0] = (
-            np.asarray(tangent_at_node0) / 3.
+            along_nodal_scales[
+                patch.along_edge_index + node0_match
+            ] * np.asarray(tangent_at_node0) / 3.
             if tangent_at_node0 is not None
             else direction_to_new_at_node1 / 3.
         )
@@ -2191,6 +2259,8 @@ def _add_single_element_patch_to_nodes_elements(patch):
             edge_sizes = prescribed_bezier_outer_edge_sizes(
                 edge_nodes, parameter_start_node, parameter_end_node,
                 patch.along_parameter_interval,
+                along_nodal_scales[patch.along_edge_index],
+                along_nodal_scales[patch.along_edge_index + 1],
             )
         else:
             edge_sizes = signed_edge_sizes(edge_nodes, edge_uv_index)
@@ -2857,7 +2927,7 @@ class jorek_node_item(QGraphicsItem):
         if self.scene() and self.scene().views():
             zoom_level = self.scene().views()[0].zoom_level
 
-        node_radius = 8.0 / zoom_level
+        node_radius = NODE_MARKER_SIZE / (2.0 * zoom_level)
         handle_radius = 8.0 / zoom_level
         pen_margin = 6.0 / zoom_level
         blue_endpoint = self.position + qt_point(self.xx[:, 1])
@@ -2889,6 +2959,16 @@ class jorek_node_item(QGraphicsItem):
             right - left + 2.0 * pen_margin,
             bottom - top + 2.0 * pen_margin,
         )
+
+    def shape(self):
+        zoom_level = 1.0
+        if self.scene() and self.scene().views():
+            zoom_level = self.scene().views()[0].zoom_level
+
+        radius = NODE_MARKER_SIZE / (2.0 * zoom_level)
+        path = QPainterPath()
+        path.addEllipse(self.position, radius, radius)
+        return path
     
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if not getattr(self, "active", True):
@@ -2940,7 +3020,7 @@ class jorek_node_item(QGraphicsItem):
    #     self.prepareGeometryChange()
 
         zoom_level = scene.views()[0].zoom_level 
-        marker_size = 16. / zoom_level
+        marker_size = NODE_MARKER_SIZE / zoom_level
         self.ellipse_size = marker_size
         self.ellipse_item.setRect(self.position.x()-self.ellipse_size/2, self.position.y()-self.ellipse_size/2,
                                   self.ellipse_size, self.ellipse_size)

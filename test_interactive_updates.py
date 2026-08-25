@@ -25,6 +25,71 @@ class UpdateRecorder:
         self.update_count += 1
 
 
+def assert_basis_handles_match_vectors(node):
+    for basis_index, handle in (
+        (1, node.blue_handle),
+        (2, node.red_handle),
+    ):
+        expected = node.position + grid_editor5.qt_point(node.xx[:, basis_index])
+        assert handle.pos() == expected
+
+
+def test_bezier_nodal_parameter_scales_use_adjacent_interval_means():
+    scales = grid_editor5.bezier_nodal_parameter_scales(
+        [0.0, 0.2, 0.5, 1.0]
+    )
+    assert np.allclose(scales, [0.2, 0.25, 0.4, 0.5])
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [[], [0.0], [0.0, 0.0], [0.0, -0.1], [0.0, np.nan]],
+)
+def test_bezier_nodal_parameter_scales_reject_invalid_intervals(parameters):
+    with pytest.raises(ValueError, match="positive|at least two"):
+        grid_editor5.bezier_nodal_parameter_scales(parameters)
+
+
+def test_prescribed_bezier_sizes_preserve_parameter_order_when_reversed():
+    parameter_start_node = object()
+    parameter_end_node = object()
+    sizes = grid_editor5.prescribed_bezier_outer_edge_sizes(
+        [parameter_end_node, parameter_start_node],
+        parameter_start_node,
+        parameter_end_node,
+        parameter_interval=0.3,
+        parameter_start_scale=0.2,
+        parameter_end_scale=0.4,
+    )
+    assert np.allclose(sizes[1, :], [-0.75, 1.5])
+
+
+def test_orient_new_node_red_vector_synchronizes_flipped_handle(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    reference_xx = np.zeros((2, 4))
+    reference_xx[:, 2] = [0.0, 1.0]
+    new_xx = np.zeros((2, 4))
+    new_xx[:, 2] = [0.0, -2.0]
+    reference_node = jorek_node_item(0, reference_xx, 2)
+    new_node = jorek_node_item(1, new_xx, 2)
+    nodes_xx = np.stack((reference_xx, new_xx), axis=2)
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx), raising=False
+    )
+
+    old_handle_position = QPointF(new_node.red_handle.pos())
+    grid_editor5.orient_new_node_red_vector(
+        new_node, reference_node, column=0, main_uv_index=1, perp_index=2
+    )
+
+    assert new_node.red_handle.pos() != old_handle_position
+    assert_basis_handles_match_vectors(new_node)
+    assert np.array_equal(
+        new_node.xx[:, 2], grid_editor5.jorek.nodes_xx[:, 2, new_node.index]
+    )
+    assert app is not None
+
+
 def test_node_drag_keeps_press_target_when_nodes_overlap(monkeypatch):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
@@ -338,6 +403,38 @@ def test_node_bounds_contain_vector_endpoints_and_handle_margin():
     assert bounds.contains(QPointF(100.0, 200.0))
     assert bounds.contains(QPointF(180.0 + 8.0, 160.0))
     assert bounds.contains(QPointF(40.0 - 8.0, 290.0))
+    assert app is not None
+
+
+@pytest.mark.parametrize("zoom_level", [0.1, 1.0, 10.0])
+def test_node_shape_only_contains_visible_marker_at_any_zoom(zoom_level):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    view.zoom_level = zoom_level
+    xx = np.zeros((2, 4))
+    xx[:, 0] = [100.0, 200.0]
+    xx[:, 1] = [1000.0, 0.0]
+    xx[:, 2] = [0.0, 1000.0]
+    node = jorek_node_item(0, xx, 0)
+    scene.addItem(node)
+
+    radius = grid_editor5.NODE_MARKER_SIZE / (2.0 * zoom_level)
+    inside = node.position + QPointF(0.99 * radius, 0.0)
+    outside = node.position + QPointF(1.01 * radius, 0.0)
+    blue_vector_middle = node.position + QPointF(500.0, 0.0)
+
+    assert node.shape().contains(inside)
+    assert not node.shape().contains(outside)
+    assert not node.shape().contains(blue_vector_middle)
+    assert node in scene.items(inside)
+    assert node not in scene.items(outside)
+    assert node not in scene.items(blue_vector_middle)
+    assert node.blue_handle in scene.items(node.blue_handle.scenePos())
+    assert node.red_handle in scene.items(node.red_handle.scenePos())
+    assert node.boundingRect().contains(node.blue_handle.pos())
+    assert node.boundingRect().contains(node.red_handle.pos())
     assert app is not None
 
 
@@ -1393,14 +1490,15 @@ def test_initial_bezier_midpoint_is_outside_owning_element(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "edge_count, radial_layers, bezier_mode",
+    "edge_count, radial_layers, bezier_mode, main_uv_index",
     [
-        (2, 1, False), (4, 1, False), (2, 2, False), (2, 4, False),
-        (2, 1, True), (2, 4, True),
+        (2, 1, False, 1), (4, 1, False, 1),
+        (2, 2, False, 1), (2, 4, False, 1),
+        (2, 1, True, 1), (2, 4, True, 1), (2, 1, True, 2),
     ],
 )
 def test_extended_patch_creates_radial_rows(
-    monkeypatch, edge_count, radial_layers, bezier_mode, capsys
+    monkeypatch, edge_count, radial_layers, bezier_mode, main_uv_index, capsys
 ):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
@@ -1408,10 +1506,11 @@ def test_extended_patch_creates_radial_rows(
     view.setScene(scene)
     inner_count = edge_count + 1
     nodes_xx = np.zeros((2, 4, inner_count))
+    radial_uv_index = main_uv_index % 2 + 1
     for index in range(inner_count):
         nodes_xx[:,0,index] = [float(index), 0.0]
-        nodes_xx[:,1,index] = [1.0, 0.0]
-        nodes_xx[:,2,index] = [0.0, 1.0 / 3.0]
+        nodes_xx[:,main_uv_index,index] = [1.0, 0.0]
+        nodes_xx[:,radial_uv_index,index] = [0.0, 1.0 / 3.0]
     inner_nodes = [
         jorek_node_item(index, nodes_xx[:,:,index], 2)
         for index in range(inner_count)
@@ -1430,8 +1529,9 @@ def test_extended_patch_creates_radial_rows(
     for index in range(edge_count):
         edge_nodes = [inner_nodes[index], inner_nodes[index + 1]]
         edge = grid_editor5.boundary_edge(
-            edge_nodes, [index, index + 1], [0,1], 100 + index, 0, 1,
-            grid_editor5.signed_edge_sizes(edge_nodes, 1),
+            edge_nodes, [index, index + 1], [0,1], 100 + index, 0,
+            main_uv_index,
+            grid_editor5.signed_edge_sizes(edge_nodes, main_uv_index),
         )
         inner_edges.append(edge)
         scene.addItem(edge)
@@ -1499,6 +1599,9 @@ def test_extended_patch_creates_radial_rows(
     assert len(grid_editor5.node_list) - old_node_count == inner_count * radial_layers
     assert len(node_rows) == radial_layers + 1
     assert all(len(row) == inner_count for row in node_rows)
+    for row in node_rows:
+        for node in row:
+            assert_basis_handles_match_vectors(node)
     assert all(
         np.linalg.norm(
             grid_editor5.np_point(created_node.position)
@@ -1512,12 +1615,15 @@ def test_extended_patch_creates_radial_rows(
     assert len({node.index for row in node_rows for node in row}) == (
         inner_count * (radial_layers + 1)
     )
-    radial_uv_index = inner_edges[0].uv_index % 2 + 1
     if radial_layers > 1:
-        assert diagnostic_output.count("main edge uv_index = 1") == (
+        assert diagnostic_output.count(
+            "main edge uv_index = " + str(main_uv_index)
+        ) == (
             inner_count * radial_layers
         )
-        assert diagnostic_output.count("perp_index = 2") == (
+        assert diagnostic_output.count(
+            "perp_index = " + str(radial_uv_index)
+        ) == (
             inner_count * radial_layers
         )
         assert diagnostic_output.count("dot after =") == (
@@ -1599,27 +1705,50 @@ def test_extended_patch_creates_radial_rows(
                 }
                 for side in range(4)
             )
-    for index, element in enumerate(elements[:edge_count]):
-        control_net = element_bezier_points(element.points, 1.0)
-        right_edge = control_net[:,3,:]
-        left_edge = control_net[:,0,:]
-        assert np.allclose(right_edge[0,:], float(index + 1))
-        assert np.allclose(left_edge[0,:], float(index))
-        layer_height = 1.0 / radial_layers
-        assert right_edge[1,0] == pytest.approx(0.0)
-        assert right_edge[1,-1] == pytest.approx(layer_height)
-        assert left_edge[1,0] == pytest.approx(0.0)
-        assert left_edge[1,-1] == pytest.approx(layer_height)
-        outer_edge = control_net[:,:,3]
-        assert np.all(np.diff(outer_edge[0,:]) >= 0)
-        assert np.allclose(outer_edge[1,:], layer_height)
-    assert all(edge.uv_index == 1 for edge in outer_edges)
-    assert all(edge.uv_index == 2 for edge in all_transverse_edges)
+    if main_uv_index == 1:
+        for index, element in enumerate(elements[:edge_count]):
+            control_net = element_bezier_points(element.points, 1.0)
+            right_edge = control_net[:,3,:]
+            left_edge = control_net[:,0,:]
+            assert np.allclose(right_edge[0,:], float(index + 1))
+            assert np.allclose(left_edge[0,:], float(index))
+            layer_height = 1.0 / radial_layers
+            assert right_edge[1,0] == pytest.approx(0.0)
+            assert right_edge[1,-1] == pytest.approx(layer_height)
+            assert left_edge[1,0] == pytest.approx(0.0)
+            assert left_edge[1,-1] == pytest.approx(layer_height)
+            outer_edge = control_net[:,:,3]
+            assert np.all(np.diff(outer_edge[0,:]) >= 0)
+            assert np.allclose(outer_edge[1,:], layer_height)
+    assert all(edge.uv_index == main_uv_index for edge in outer_edges)
+    assert all(edge.uv_index == radial_uv_index for edge in all_transverse_edges)
     if bezier_mode:
         assert diagnostic_output.count("Bezier outer edge") == edge_count
-        for node, tangent in zip(node_rows[-1], patch.outer_tangents):
-            assert np.allclose(node.xx[:, 1], np.asarray(tangent) / 3.0)
-            assert np.dot(node.xx[:, 1], np.asarray(tangent)) > 0.0
+        nodal_scales = grid_editor5.bezier_nodal_parameter_scales(
+            patch.outer_parameters
+        )
+        for node, tangent, scale in zip(
+            node_rows[-1], patch.outer_tangents, nodal_scales
+        ):
+            assert np.allclose(
+                node.xx[:, main_uv_index], scale * np.asarray(tangent) / 3.0
+            )
+            assert np.dot(
+                node.xx[:, main_uv_index], np.asarray(tangent)
+            ) > 0.0
+            assert_basis_handles_match_vectors(node)
+        neighbouring_magnitudes = [
+            np.linalg.norm(node.xx[:, main_uv_index]) for node in node_rows[-2]
+        ]
+        outer_magnitudes = [
+            np.linalg.norm(node.xx[:, main_uv_index]) for node in node_rows[-1]
+        ]
+        assert all(
+            0.25 <= outer / neighbouring <= 4.0
+            for outer, neighbouring in zip(
+                outer_magnitudes, neighbouring_magnitudes
+            )
+        )
         final_indices = [node.index for node in node_rows[-1]]
         for index in range(edge_count):
             edge = next(
@@ -1635,11 +1764,30 @@ def test_extended_patch_creates_radial_rows(
                 controls = controls[:, ::-1]
             dt = patch.outer_parameters[index + 1] - patch.outer_parameters[index]
             expected_sizes = (
-                np.array([dt, -dt])
+                np.array([
+                    dt / nodal_scales[index],
+                    -dt / nodal_scales[index + 1],
+                ])
                 if edge.vertices[0] == final_indices[index]
-                else np.array([-dt, dt])
+                else np.array([
+                    -dt / nodal_scales[index + 1],
+                    dt / nodal_scales[index],
+                ])
             )
             assert np.allclose(edge.sizes[1, :], expected_sizes)
+            expected_effective_by_node = {
+                final_indices[index]: (
+                    dt * np.asarray(patch.outer_tangents[index]) / 3.0
+                ),
+                final_indices[index + 1]: (
+                    -dt * np.asarray(patch.outer_tangents[index + 1]) / 3.0
+                ),
+            }
+            for endpoint, node in enumerate(edge.nodes):
+                assert np.allclose(
+                    node.xx[:, main_uv_index] * edge.sizes[1, endpoint],
+                    expected_effective_by_node[node.index],
+                )
             expected_controls = np.column_stack((
                 grid_editor5.np_point(patch.outer_nodes[index].position),
                 grid_editor5.np_point(patch.outer_nodes[index].position)
