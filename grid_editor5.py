@@ -1446,6 +1446,7 @@ class this_view(QGraphicsView):
         self.rubberBand  = None
         self.start_point = None
         self.end_point   = None
+        self.rubberband_mode = None
         self.zoom_level  = 1.0
         self.selected_point = None
         self.dragged_node = None
@@ -1551,19 +1552,8 @@ class this_view(QGraphicsView):
         self._previous_viewport_size = QSize(new_size)
 
     def clear_selection(self):
-        for edge in self.selected_edges:
-            edge.setPen(boundary_edge_pen())
-            edge.update()
-        self.selected_edges = []
-        for element in self.selected_elements:
-            element.path_item.setBrush(QBrush(QColor(255, 255, 255, 64)))
-            element.update()
-        self.selected_elements = []
-        for node in self.selected_nodes:
-            color = QColor(0, 0, 255) if node.boundary else QColor(255, 0, 0)
-            node.ellipse_item.setBrush(QBrush(color))
-            node.update()
-        self.selected_nodes = []
+        self.finish_rubber_band()
+        self.replace_boundary_edge_selection([])
         if (
             self.current_patch is not None
             and isinstance(self.current_patch, QGraphicsItem)
@@ -1579,6 +1569,93 @@ class this_view(QGraphicsView):
         self.pending_main_uv_index = None
         self.pending_bezier_mode = False
         self.update_patch_controls()
+
+    def set_edge_selected(self, edge, selected):
+        edge.setPen(
+            boundary_edge_pen(Qt.green, 2.5)
+            if selected else boundary_edge_pen()
+        )
+        edge.update()
+
+    def refresh_selection_highlights(self):
+        for element in self.selected_elements:
+            element.path_item.setBrush(QBrush(QColor(255, 255, 255, 64)))
+            element.update()
+        for node in self.selected_nodes:
+            color = QColor(0, 0, 255) if node.boundary else QColor(255, 0, 0)
+            node.ellipse_item.setBrush(QBrush(color))
+            node.update()
+
+        self.selected_nodes = []
+        self.selected_elements = []
+        for edge in self.selected_edges:
+            for node in edge.nodes:
+                if (
+                    isinstance(node, jorek_node_item)
+                    and getattr(node, "active", True)
+                    and node not in self.selected_nodes
+                ):
+                    self.selected_nodes.append(node)
+            element = element_by_index(edge.element_index)
+            if (
+                isinstance(element, jorek_element_item)
+                and getattr(element, "active", True)
+                and element not in self.selected_elements
+            ):
+                self.selected_elements.append(element)
+
+        for node in self.selected_nodes:
+            node.ellipse_item.setBrush(QBrush(QColor(0, 255, 0)))
+            node.update()
+        for element in self.selected_elements:
+            element.path_item.setBrush(QBrush(QColor(50, 50, 50, 64)))
+            element.update()
+
+    def replace_boundary_edge_selection(self, edges):
+        for edge in self.selected_edges:
+            self.set_edge_selected(edge, False)
+        self.selected_edges = []
+        for edge in edges:
+            if (
+                getattr(edge, "active", True)
+                and edge not in self.selected_edges
+            ):
+                self.selected_edges.append(edge)
+                self.set_edge_selected(edge, True)
+        self.refresh_selection_highlights()
+
+    def add_boundary_edge_selection(self, edges):
+        for edge in edges:
+            if (
+                getattr(edge, "active", True)
+                and edge not in self.selected_edges
+            ):
+                self.selected_edges.append(edge)
+                self.set_edge_selected(edge, True)
+        self.refresh_selection_highlights()
+
+    def toggle_boundary_edge_selection(self, edges):
+        processed = []
+        for edge in edges:
+            if not getattr(edge, "active", True) or edge in processed:
+                continue
+            processed.append(edge)
+            if edge in self.selected_edges:
+                self.selected_edges.remove(edge)
+                self.set_edge_selected(edge, False)
+            else:
+                self.selected_edges.append(edge)
+                self.set_edge_selected(edge, True)
+        self.refresh_selection_highlights()
+
+    def finish_rubber_band(self):
+        if self.rubberBand is not None:
+            self.rubberBand.hide()
+            self.rubberBand.deleteLater()
+        self.rubberBand = None
+        self.start_point = None
+        self.end_point = None
+        self.rubberband_mode = None
 
     def set_patch_status(self, message):
         if self.patch_controls is not None:
@@ -1639,11 +1716,6 @@ class this_view(QGraphicsView):
         self.clear_selection()
         self.selected_point = None
         self.dragged_node = None
-        if self.rubberBand is not None:
-            self.rubberBand.hide()
-        self.rubberBand = None
-        self.start_point = None
-        self.end_point = None
         self.editable_depth = depth
         if self.scene() is not None and self.scene() is globals().get("scene"):
             rebuild_graphics_layers(active_view=self)
@@ -1875,7 +1947,11 @@ class this_view(QGraphicsView):
 
     def mousePressEvent(self, event):        
 
-        modifiers = QApplication.keyboardModifiers()
+        modifiers = (
+            event.modifiers()
+            if hasattr(event, "modifiers")
+            else QApplication.keyboardModifiers()
+        )
         if modifiers == Qt.ControlModifier:
             if self.current_extended_patch is not None:
                 if not self.current_extended_patch.add_outer_node(
@@ -1941,6 +2017,15 @@ class this_view(QGraphicsView):
                     return
       
             self.start_point = event.pos()
+            if (
+                modifiers & Qt.ShiftModifier
+                and modifiers & Qt.ControlModifier
+            ):
+                self.rubberband_mode = "toggle"
+            elif modifiers & Qt.ShiftModifier:
+                self.rubberband_mode = "add"
+            else:
+                self.rubberband_mode = None
             self.rubberBand = QRubberBand(
                 QRubberBand.Rectangle, self.viewport()
             )
@@ -1972,53 +2057,27 @@ class this_view(QGraphicsView):
             rebuild_static_mesh_path(self.scene())
             event.accept()
             return
-        modifiers = QApplication.keyboardModifiers()
-        if modifiers == Qt.ControlModifier:
-          return
-
-        if (not self.rubberBand) or (not self.end_point): return
-        self.rubberBand.hide()
+        if (not self.rubberBand) or (not self.end_point):
+            self.finish_rubber_band()
+            return
 
         zoom_rect = QRect(self.start_point, self.end_point).normalized()
 
-        modifiers = QApplication.keyboardModifiers()
-        if modifiers == Qt.ShiftModifier:
-            print("shift key pressed")
+        if self.rubberband_mode in ("add", "toggle"):
             items = self.items(zoom_rect)
-            self.selected_nodes = []
-            for item in items:
-                if (
-                    isinstance(item, jorek_node_item)
-                    and getattr(item, "active", True)
-                ):
-                    if item.boundary:
-                        self.selected_nodes.append(item)
-                        item.ellipse_item.setBrush(QBrush(QColor(0, 255, 0)))
-                        print("selected node : ",item.index)
-            self.selected_elements = []
-            for item in items:
-                if (
-                    isinstance(item, jorek_element_item)
-                    and getattr(item, "active", True)
-                ):
-                    this_element_bnd_nodes = 0
-                    for node in self.selected_nodes:
-                        if node.index in item.vertices:
-                            this_element_bnd_nodes = this_element_bnd_nodes + 1
-                    if this_element_bnd_nodes >= 2:
-                        self.selected_elements.append(item)
-                        item.path_item.setBrush(QBrush(QColor(50, 50, 50, 64)))
-                        item.update()
-                        print("selected elements : ",item.index)
-            for item in items:
+            hit_edges = [
+                item for item in items
                 if (
                     isinstance(item, boundary_edge)
                     and getattr(item, "active", True)
-                ):
-                    if item not in self.selected_edges:
-                        print("selected boundary edge : ",item.element_index,item.element_side,item.vertices)
-                        self.selected_edges.append(item)
-                    item.setPen(boundary_edge_pen(Qt.green, 2.5))
+                )
+            ]
+            if self.rubberband_mode == "add":
+                print("shift key pressed: add to edge selection")
+                self.add_boundary_edge_selection(hit_edges)
+            else:
+                print("ctrl+shift pressed: toggle edge selection")
+                self.toggle_boundary_edge_selection(hit_edges)
             self.update_patch_controls()
 
         else:
@@ -2031,9 +2090,7 @@ class this_view(QGraphicsView):
  
                 self.centerOn(self.mapToScene(zoom_rect.center()))
                 self.setTransform(QTransform().scale(self.zoom_level, self.zoom_level))
-
-                self.start_point = None
-                self.end_point   = None
+        self.finish_rubber_band()
 
 
 class extended_patch_controls(QGroupBox):
@@ -2369,6 +2426,7 @@ class grid_editor_window(QMainWindow):
         self.view.rubberBand = None
         self.view.start_point = None
         self.view.end_point = None
+        self.view.rubberband_mode = None
         self.view.selected_point = None
         self.view.dragged_node = None
         self.view.selected_edges = []

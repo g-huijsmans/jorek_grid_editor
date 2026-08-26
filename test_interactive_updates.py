@@ -108,6 +108,68 @@ def editable_depth_grid(size=5):
     )
 
 
+def rubberband_selection_case(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    nodes_xx = np.zeros((2, 4, 4))
+    nodes_xx[0, 0, :] = np.arange(4.0)
+    nodes = [
+        jorek_node_item(index, nodes_xx[:, :, index], 1)
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx),
+        raising=False,
+    )
+    monkeypatch.setattr(grid_editor5, "this_scaling", 1.0, raising=False)
+    elements = [
+        grid_editor5.jorek_element_item(
+            index, np.array([0, 1, 2, 3]), np.ones((4, 4))
+        )
+        for index in range(3)
+    ]
+    edges = [
+        grid_editor5.boundary_edge(
+            nodes[index:index + 2], [index, index + 1], [0, 1],
+            index, 0, 1, np.ones((2, 2)),
+        )
+        for index in range(3)
+    ]
+    for item in nodes + elements + edges:
+        scene.addItem(item)
+    monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
+    monkeypatch.setattr(grid_editor5, "element_list", elements, raising=False)
+    monkeypatch.setattr(grid_editor5, "boundary_list", edges, raising=False)
+    monkeypatch.setattr(grid_editor5, "scene", scene, raising=False)
+    monkeypatch.setattr(grid_editor5, "view", view, raising=False)
+    return SimpleNamespace(
+        app=app, scene=scene, view=view, nodes=nodes,
+        elements=elements, edges=edges,
+    )
+
+
+def perform_rubberband_selection(view, monkeypatch, modifiers, hit_edges):
+    monkeypatch.setattr(
+        view, "items",
+        lambda position: list(hit_edges) if isinstance(position, QRect) else [],
+    )
+
+    def event(position, event_modifiers=modifiers):
+        return SimpleNamespace(
+            pos=lambda: position,
+            modifiers=lambda: event_modifiers,
+            accept=lambda: None,
+        )
+
+    view.mousePressEvent(event(QPoint(10, 10)))
+    view.mouseMoveEvent(event(QPoint(20, 20)))
+    mode = view.rubberband_mode
+    view.mouseReleaseEvent(event(QPoint(20, 20), Qt.NoModifier))
+    return mode
+
+
 def assert_basis_handles_match_vectors(node):
     for basis_index, handle in (
         (1, node.blue_handle),
@@ -488,6 +550,110 @@ def test_cosmetic_boundary_edge_shape_matches_visible_screen_width(monkeypatch):
         grid_editor5.BOUNDARY_EDGE_WIDTH
     )
     assert app is not None
+
+
+def test_shift_rubberband_adds_edges_without_clearing_or_duplicates(monkeypatch):
+    case = rubberband_selection_case(monkeypatch)
+
+    mode = perform_rubberband_selection(
+        case.view, monkeypatch, Qt.ShiftModifier,
+        [case.edges[0], case.edges[0]],
+    )
+    assert mode == "add"
+    assert case.view.selected_edges == [case.edges[0]]
+    assert case.edges[0].pen().color() == Qt.green
+
+    perform_rubberband_selection(
+        case.view, monkeypatch, Qt.ShiftModifier, [case.edges[2]]
+    )
+    assert case.view.selected_edges == [case.edges[0], case.edges[2]]
+    assert case.edges[0].pen().color() == Qt.green
+    assert case.edges[2].pen().color() == Qt.green
+
+    perform_rubberband_selection(
+        case.view, monkeypatch, Qt.ShiftModifier,
+        [case.edges[0], case.edges[1], case.edges[1]],
+    )
+    assert case.view.selected_edges == [
+        case.edges[0], case.edges[2], case.edges[1]
+    ]
+    assert len(case.view.selected_edges) == len(set(case.view.selected_edges))
+    assert all(edge.pen().color() == Qt.green for edge in case.edges)
+    assert all(edge.pen().widthF() == pytest.approx(2.5) for edge in case.edges)
+    assert case.view.selected_nodes == case.nodes
+    assert case.view.selected_elements == [
+        case.elements[0], case.elements[2], case.elements[1]
+    ]
+    assert case.view.rubberBand is None
+    assert case.view.start_point is None
+    assert case.view.end_point is None
+    assert case.view.rubberband_mode is None
+    assert case.app is not None
+
+
+def test_ctrl_shift_rubberband_toggles_mixed_edges_and_is_reversible(
+    monkeypatch,
+):
+    case = rubberband_selection_case(monkeypatch)
+    case.view.replace_boundary_edge_selection([case.edges[0]])
+
+    mode = perform_rubberband_selection(
+        case.view, monkeypatch,
+        Qt.ControlModifier | Qt.ShiftModifier,
+        [case.edges[0], case.edges[1], case.edges[1]],
+    )
+
+    assert mode == "toggle"
+    assert case.view.selected_edges == [case.edges[1]]
+    assert case.edges[0].pen().color() == Qt.yellow
+    assert case.edges[1].pen().color() == Qt.green
+    assert case.edges[2].pen().color() == Qt.yellow
+    assert case.view.selected_nodes == [case.nodes[1], case.nodes[2]]
+    assert case.view.selected_elements == [case.elements[1]]
+
+    perform_rubberband_selection(
+        case.view, monkeypatch,
+        Qt.ControlModifier | Qt.ShiftModifier,
+        [case.edges[0], case.edges[1]],
+    )
+    assert case.view.selected_edges == [case.edges[0]]
+    assert case.edges[0].pen().color() == Qt.green
+    assert case.edges[1].pen().color() == Qt.yellow
+    assert case.edges[2].pen().color() == Qt.yellow
+    assert case.view.selected_nodes == [case.nodes[0], case.nodes[1]]
+    assert case.view.selected_elements == [case.elements[0]]
+
+    perform_rubberband_selection(
+        case.view, monkeypatch,
+        Qt.ControlModifier | Qt.ShiftModifier,
+        [case.edges[2]],
+    )
+    assert case.view.selected_edges == [case.edges[0], case.edges[2]]
+    assert case.view.selected_elements == [case.elements[0], case.elements[2]]
+    assert case.app is not None
+
+
+def test_escape_clears_toggle_selection_and_pending_rubberband(monkeypatch):
+    case = rubberband_selection_case(monkeypatch)
+    case.view.replace_boundary_edge_selection([case.edges[0], case.edges[1]])
+    monkeypatch.setattr(case.view, "items", lambda position: [])
+    event = SimpleNamespace(
+        pos=lambda: QPoint(10, 10),
+        modifiers=lambda: Qt.ControlModifier | Qt.ShiftModifier,
+        accept=lambda: None,
+    )
+    case.view.mousePressEvent(event)
+    assert case.view.rubberband_mode == "toggle"
+
+    case.view.keyPressEvent(SimpleNamespace(key=lambda: Qt.Key_Escape))
+
+    assert case.view.selected_edges == []
+    assert case.view.selected_nodes == []
+    assert case.view.selected_elements == []
+    assert case.view.rubberBand is None
+    assert case.view.rubberband_mode is None
+    assert all(edge.pen().color() == Qt.yellow for edge in case.edges)
+    assert case.app is not None
 
 
 def test_resize_fits_only_active_grid_with_uniform_transform(monkeypatch):
