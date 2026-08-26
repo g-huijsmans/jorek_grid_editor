@@ -1,12 +1,20 @@
 import sys
+import os
 import random
 import string
 import math
+import tempfile
+import time
+import ctypes
 import numpy as np
-from PySide2.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize
+from PySide2.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QTimer
 from PySide2.QtGui import QPen, QFont, QBrush, QColor, QMouseEvent, QPainter, QPainterPath, QTransform
-from PySide2.QtWidgets import QApplication, QGraphicsView, QGraphicsScene
-from PySide2.QtWidgets import QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsItem, QRubberBand
+from PySide2.QtWidgets import (
+    QAction, QApplication, QComboBox, QFileDialog, QGraphicsEllipseItem, QGraphicsItem,
+    QGraphicsPathItem, QGraphicsScene, QGraphicsView, QGroupBox,
+    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QRubberBand,
+    QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+)
 
 from jorek             import *
 from jorek_bezier      import edge_bezier_points, element_bezier_points
@@ -16,12 +24,445 @@ from jorek_geometry    import (
     reorder_corners,
 )
 
+jorek_grid = jorek
 
-NODE_MARKER_SIZE = 16.0
+
+NODE_MARKER_SIZE = 8.0
+VECTOR_HANDLE_SIZE = 8.0
+BASIS_VECTOR_WIDTH = 2.0
+EXTENDED_PATCH_NODE_SIZE = 6.0
+EXTENDED_BEZIER_HANDLE_SIZE = 9.0
+EXTENDED_PATCH_LINE_WIDTH = 1.75
+GRAPHICS_HANDLE_OUTLINE_WIDTH = 1.0
+BOUNDARY_EDGE_WIDTH = 1.5
+STATIC_MESH_WIDTH = 0.75
+Z_STATIC_MESH = -1.0
 Z_MESH_EDGE = 0.0
+Z_BOUNDARY_EDGE = 0.5
 Z_PATCH_PREVIEW = 1.0
 Z_NODE = 2.0
 Z_VECTOR_HANDLE = 4.0
+
+this_scaling = 100.0
+node_list = []
+element_list = []
+boundary_list = []
+scene = None
+view = None
+static_mesh = None
+
+MEMORY_DIAGNOSTICS = os.environ.get(
+    "JOREK_GRID_MEMORY_DIAGNOSTICS", "0"
+) == "1"
+DIAGNOSTIC_ELEMENTS_ONLY = os.environ.get(
+    "JOREK_GRID_DIAGNOSTIC_ELEMENTS_ONLY", "0"
+) == "1"
+DIAGNOSTIC_BASIS_SCALE = os.environ.get(
+    "JOREK_GRID_DIAGNOSTIC_BASIS_SCALE", "0"
+) == "1"
+SHOW_EDGE_INDICES = os.environ.get(
+    "JOREK_GRID_SHOW_EDGE_INDICES", "0"
+) == "1"
+_memory_diagnostic_records = []
+_memory_diagnostic_previous_time = None
+_memory_diagnostic_previous_rss = None
+_memory_diagnostic_peak_rss = None
+_diagnostic_nodes_xx_before = None
+
+
+def boundary_edge_pen(color=Qt.yellow, width=BOUNDARY_EDGE_WIDTH):
+    pen = QPen(color)
+    pen.setWidthF(width)
+    pen.setCosmetic(True)
+    return pen
+
+
+def graphics_handle_outline_pen():
+    pen = QPen(Qt.black)
+    pen.setWidthF(GRAPHICS_HANDLE_OUTLINE_WIDTH)
+    pen.setCosmetic(True)
+    return pen
+
+
+def graphics_item_in_scene(item, expected_scene):
+    if item is None:
+        return False
+    try:
+        return item.scene() is expected_scene
+    except RuntimeError:
+        return False
+
+
+def _process_rss_bytes():
+    global _memory_diagnostic_peak_rss
+    try:
+        import psutil
+        memory_info = psutil.Process(os.getpid()).memory_info()
+        _memory_diagnostic_peak_rss = getattr(
+            memory_info, "peak_wset", _memory_diagnostic_peak_rss
+        )
+        return memory_info.rss
+    except ImportError:
+        if os.name != "nt":
+            try:
+                import resource
+                rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                return rss if sys.platform == "darwin" else rss * 1024
+            except ImportError:
+                return None
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        process = ctypes.windll.kernel32.GetCurrentProcess()
+        if not ctypes.windll.psapi.GetProcessMemoryInfo(
+            process, ctypes.byref(counters), counters.cb
+        ):
+            return None
+        _memory_diagnostic_peak_rss = counters.PeakWorkingSetSize
+        return counters.WorkingSetSize
+
+
+def reset_memory_diagnostics():
+    global _memory_diagnostic_previous_time, _memory_diagnostic_previous_rss
+    global _memory_diagnostic_peak_rss
+    _memory_diagnostic_records[:] = []
+    _memory_diagnostic_peak_rss = None
+    _memory_diagnostic_previous_time = time.perf_counter()
+    _memory_diagnostic_previous_rss = _process_rss_bytes()
+
+
+def report_memory(stage):
+    """Temporary process/graphics checkpoint enabled only for diagnostics."""
+    global _memory_diagnostic_previous_time, _memory_diagnostic_previous_rss
+    if not MEMORY_DIAGNOSTICS:
+        return
+    now = time.perf_counter()
+    rss_bytes = _process_rss_bytes()
+    rss_mb = rss_bytes / 1024.0 ** 2 if rss_bytes is not None else float("nan")
+    previous_rss = _memory_diagnostic_previous_rss
+    delta_mb = (
+        (rss_bytes - previous_rss) / 1024.0 ** 2
+        if rss_bytes is not None and previous_rss is not None else float("nan")
+    )
+    elapsed = (
+        now - _memory_diagnostic_previous_time
+        if _memory_diagnostic_previous_time is not None else 0.0
+    )
+    current_scene = globals().get("scene")
+    scene_items = current_scene.items() if current_scene is not None else []
+    type_counts = {}
+    for item in scene_items:
+        name = type(item).__name__
+        type_counts[name] = type_counts.get(name, 0) + 1
+    nodes = globals().get("node_list", []) or []
+    elements = globals().get("element_list", []) or []
+    boundaries = globals().get("boundary_list", []) or []
+    print(
+        "[MEM] {} | RSS={:.1f} MB | delta={:+.1f} MB | time={:.3f} s".format(
+            stage, rss_mb, delta_mb, elapsed
+        ),
+        flush=True,
+    )
+    print(
+        "      nodes={} elements={} boundary_edges={} scene_items={}".format(
+            len(nodes), len(elements), len(boundaries), len(scene_items)
+        ),
+        flush=True,
+    )
+    if type_counts:
+        print(
+            "      scene types: " + ", ".join(
+                "{}={}".format(name, count)
+                for name, count in sorted(type_counts.items())
+            ),
+            flush=True,
+        )
+    _memory_diagnostic_records.append((stage, rss_mb, delta_mb, elapsed))
+    _memory_diagnostic_previous_time = now
+    _memory_diagnostic_previous_rss = rss_bytes
+
+
+def report_grid_array_memory(grid):
+    if not MEMORY_DIAGNOSTICS:
+        return
+    arrays = {
+        "x": grid.nodes_xx,
+        "boundary": grid.boundary,
+        "vertex": grid.vertices,
+        "size": grid.elements_size,
+    }
+    total = sum(np.asarray(array).nbytes for array in arrays.values())
+    print(
+        "[MEM] raw grid arrays: {} = {:.2f} MB".format(
+            ", ".join(
+                "{} {:.2f} MB".format(
+                    name, np.asarray(array).nbytes / 1024.0 ** 2
+                )
+                for name, array in arrays.items()
+            ),
+            total / 1024.0 ** 2,
+        ),
+        flush=True,
+    )
+
+
+def report_boundary_diagnostics():
+    if not MEMORY_DIAGNOSTICS:
+        return
+    boundary_nodes = {
+        node.index for node in node_list if node.boundary != 0
+    }
+    touching_elements = {
+        element.index for element in element_list
+        if any(vertex in boundary_nodes for vertex in element.vertices)
+    }
+    elements_with_edges = {
+        edge.element_index for edge in boundary_list
+        if edge.element_index is not None
+    }
+    print(
+        "[MEM] boundary diagnostics: boundary_nodes={} "
+        "boundary_edges={} touching_elements={} elements_with_edges={}".format(
+            len(boundary_nodes), len(boundary_list),
+            len(touching_elements), len(elements_with_edges),
+        ),
+        flush=True,
+    )
+
+
+def report_graphics_multiplication():
+    if not MEMORY_DIAGNOSTICS:
+        return
+    node_count = sum(
+        isinstance(node, jorek_node_item) for node in node_list
+    )
+    element_count = sum(
+        isinstance(element, jorek_element_item) for element in element_list
+    )
+    print(
+        "[MEM] graphics multiplication: per node = 1 jorek_node_item + "
+        "1 ellipse_item + 2 basis_vector_handle; implied node objects = {}".format(
+            4 * node_count
+        ),
+        flush=True,
+    )
+    print(
+        "[MEM] graphics multiplication: per element = 1 jorek_element_item + "
+        "1 path_item; implied element objects = {}".format(2 * element_count),
+        flush=True,
+    )
+
+
+def print_memory_diagnostic_table():
+    if not MEMORY_DIAGNOSTICS:
+        return
+    print("\n[MEM] summary", flush=True)
+    print("stage | RSS MB | delta MB | time s", flush=True)
+    for stage, rss_mb, delta_mb, elapsed in _memory_diagnostic_records:
+        print(
+            "{} | {:.1f} | {:+.1f} | {:.3f}".format(
+                stage, rss_mb, delta_mb, elapsed
+            ),
+            flush=True,
+        )
+    if _memory_diagnostic_records:
+        biggest = max(_memory_diagnostic_records, key=lambda record: record[2])
+        print(
+            "[MEM] biggest checkpoint jump: {} ({:+.1f} MB)".format(
+                biggest[0], biggest[2]
+            ),
+            flush=True,
+        )
+    if _memory_diagnostic_peak_rss is not None:
+        print(
+            "[MEM] process peak RSS: {:.1f} MB".format(
+                _memory_diagnostic_peak_rss / 1024.0 ** 2
+            ),
+            flush=True,
+        )
+
+
+def _ratio_statistics(values):
+    values = np.asarray(values)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return float("nan"), float("nan"), float("nan")
+    return tuple(np.percentile(values, [50.0, 90.0, 100.0]))
+
+
+def report_basis_scale_diagnostics(grid):
+    """Compare raw nodal derivatives with element-local control vectors."""
+    if not DIAGNOSTIC_BASIS_SCALE:
+        return
+
+    positions = grid.nodes_xx[:, 0, grid.vertices]
+    raw_u_vectors = grid.nodes_xx[:, 1, grid.vertices]
+    raw_v_vectors = grid.nodes_xx[:, 2, grid.vertices]
+    u_neighbor = np.array([1, 0, 3, 2])
+    v_neighbor = np.array([3, 2, 1, 0])
+    chord_u = np.linalg.norm(
+        positions - positions[:, u_neighbor, :], axis=0
+    )
+    chord_v = np.linalg.norm(
+        positions - positions[:, v_neighbor, :], axis=0
+    )
+    raw_u = np.linalg.norm(raw_u_vectors, axis=0)
+    raw_v = np.linalg.norm(raw_v_vectors, axis=0)
+    effective_u = np.linalg.norm(
+        raw_u_vectors * grid.elements_size[1, :, :][None, :, :], axis=0
+    )
+    effective_v = np.linalg.norm(
+        raw_v_vectors * grid.elements_size[2, :, :][None, :, :], axis=0
+    )
+    valid_u = chord_u > np.finfo(float).eps
+    valid_v = chord_v > np.finfo(float).eps
+    ratios = {
+        "raw_u / chord_u": raw_u[valid_u] / chord_u[valid_u],
+        "effective_u / chord_u": effective_u[valid_u] / chord_u[valid_u],
+        "raw_v / chord_v": raw_v[valid_v] / chord_v[valid_v],
+        "effective_v / chord_v": effective_v[valid_v] / chord_v[valid_v],
+    }
+    print("[BASIS] aggregate ratios (median, p90, maximum)", flush=True)
+    for name, values in ratios.items():
+        median, p90, maximum = _ratio_statistics(values)
+        print(
+            "        {:26s} {:10.4g} {:10.4g} {:10.4g}".format(
+                name, median, p90, maximum
+            ),
+            flush=True,
+        )
+
+    centroids = positions.mean(axis=1)
+    center = np.median(centroids, axis=1)
+    boundary_elements = np.any(grid.boundary[grid.vertices] != 0, axis=0)
+    interior_indices = np.flatnonzero(~boundary_elements)
+    boundary_indices = np.flatnonzero(boundary_elements)
+
+    samples = [(
+        "central/core proxy",
+        int(np.argmin(np.linalg.norm(centroids - center[:, None], axis=0))),
+    )]
+    if interior_indices.size:
+        samples.append((
+            "outer-R interior proxy",
+            int(interior_indices[np.argmax(centroids[0, interior_indices])]),
+        ))
+    samples.extend([
+        ("lower/divertor proxy", int(np.argmin(centroids[1]))),
+        ("upper/SOL proxy", int(np.argmax(centroids[1]))),
+    ])
+    if boundary_indices.size:
+        samples.extend([
+            ("boundary outer-R", int(
+                boundary_indices[np.argmax(centroids[0, boundary_indices])]
+            )),
+            ("boundary lower", int(
+                boundary_indices[np.argmin(centroids[1, boundary_indices])]
+            )),
+        ])
+
+    unique_samples = []
+    seen = set()
+    for label, element_index in samples:
+        if element_index not in seen:
+            unique_samples.append((label, element_index))
+            seen.add(element_index)
+
+    print("[BASIS] representative element vertices", flush=True)
+    for label, element_index in unique_samples:
+        print(
+            "[BASIS] {}: element {} centroid=({:.6g}, {:.6g})".format(
+                label, element_index,
+                centroids[0, element_index], centroids[1, element_index],
+            ),
+            flush=True,
+        )
+        for local_vertex, node_index in enumerate(
+            grid.vertices[:, element_index]
+        ):
+            cu = chord_u[local_vertex, element_index]
+            cv = chord_v[local_vertex, element_index]
+            ru = raw_u[local_vertex, element_index]
+            rv = raw_v[local_vertex, element_index]
+            eu = effective_u[local_vertex, element_index]
+            ev = effective_v[local_vertex, element_index]
+            print(
+                "        vertex {} node {} | "
+                "u chord={:.5g} raw={:.5g} effective={:.5g} "
+                "ratios=({:.4g}, {:.4g}) | "
+                "v chord={:.5g} raw={:.5g} effective={:.5g} "
+                "ratios=({:.4g}, {:.4g})".format(
+                    local_vertex, node_index,
+                    cu, ru, eu, ru / cu, eu / cu,
+                    cv, rv, ev, rv / cv, ev / cv,
+                ),
+                flush=True,
+            )
+
+    print("[BASIS] element_bezier_points control-vector checks", flush=True)
+    for unused_label, element_index in unique_samples[:4]:
+        vertices = grid.vertices[:, element_index]
+        raw_points = grid.nodes_xx[:, :, vertices]
+        scaled_points = raw_points.copy()
+        scaled_points *= grid.elements_size[:, :, element_index][None, :, :]
+        control_points = element_bezier_points(scaled_points, this_scaling)
+        actual_u = control_points[:, 1, 0] - control_points[:, 0, 0]
+        actual_v = control_points[:, 0, 1] - control_points[:, 0, 0]
+        expected_u = this_scaling * scaled_points[:, 1, 0]
+        expected_v = this_scaling * scaled_points[:, 2, 0]
+        print(
+            "        element {} vertex 0: raw_u={:.5g} scaled_u={:.5g} "
+            "control_error_u={:.3g}; raw_v={:.5g} scaled_v={:.5g} "
+            "control_error_v={:.3g}".format(
+                element_index,
+                np.linalg.norm(raw_points[:, 1, 0]),
+                np.linalg.norm(scaled_points[:, 1, 0]),
+                np.linalg.norm(actual_u - expected_u),
+                np.linalg.norm(raw_points[:, 2, 0]),
+                np.linalg.norm(scaled_points[:, 2, 0]),
+                np.linalg.norm(actual_v - expected_v),
+            ),
+            flush=True,
+        )
+
+    element_selection = grid.nodes_xx[:, :, grid.vertices[:, 0]]
+    boundary_vertices = grid.vertices[:2, 0].tolist()
+    boundary_selection = (
+        grid.nodes_xx[:, 0:2, boundary_vertices] * this_scaling
+    )
+    print(
+        "[BASIS] NumPy aliasing: element advanced indexing shares memory={} ; "
+        "boundary advanced indexing/scaling shares memory={}".format(
+            np.shares_memory(element_selection, grid.nodes_xx),
+            np.shares_memory(boundary_selection, grid.nodes_xx),
+        ),
+        flush=True,
+    )
+
+
+def verify_diagnostic_grid_unchanged(grid, stage):
+    if not DIAGNOSTIC_BASIS_SCALE or _diagnostic_nodes_xx_before is None:
+        return
+    unchanged = np.array_equal(grid.nodes_xx, _diagnostic_nodes_xx_before)
+    print(
+        "[BASIS] nodes_xx unchanged {}: {}".format(stage, unchanged),
+        flush=True,
+    )
+    assert unchanged, "Diagnostic detected in-place modification of nodes_xx"
 
 
 def validate_single_element_patch(selected_edges):
@@ -581,12 +1022,18 @@ def boundary_chain_outward_displacement(ordered_edges):
 
 class extended_bezier_handle(QGraphicsEllipseItem):
     def __init__(self, patch, role, position, color):
-        super().__init__(-6., -6., 12., 12., patch)
+        radius = EXTENDED_BEZIER_HANDLE_SIZE / 2.0
+        super().__init__(
+            -radius, -radius,
+            EXTENDED_BEZIER_HANDLE_SIZE, EXTENDED_BEZIER_HANDLE_SIZE,
+            patch,
+        )
         self.patch = patch
         self.role = role
         self.setPos(position)
         self.setBrush(QBrush(color))
-        self.setPen(QPen(Qt.black, 1.))
+        self.setPen(graphics_handle_outline_pen())
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         self.setZValue(Z_VECTOR_HANDLE)
 
     def move_to_scene(self, scene_position):
@@ -607,6 +1054,10 @@ class extended_patch(QGraphicsPathItem):
     def __init__(self, ordered_nodes, ordered_edges, can_commit=True):
         super().__init__()
         self.setZValue(Z_PATCH_PREVIEW)
+        preview_pen = QPen(Qt.black)
+        preview_pen.setWidthF(EXTENDED_PATCH_LINE_WIDTH)
+        preview_pen.setCosmetic(True)
+        self.setPen(preview_pen)
         self.ordered_nodes = ordered_nodes
         self.ordered_edges = ordered_edges
         self.outer_nodes = []
@@ -944,8 +1395,13 @@ class extended_patch(QGraphicsPathItem):
         self.update()
 
     def paint(self, painter: QPainter, option, widget=None):
-        painter.setPen(QPen(Qt.black, 1.0))
+        painter.setPen(self.pen())
         painter.drawPath(self.path())
+        zoom_level = 1.0
+        if self.scene() and self.scene().views():
+            zoom_level = self.scene().views()[0].zoom_level
+        preview_node_size = EXTENDED_PATCH_NODE_SIZE / zoom_level
+        preview_node_radius = preview_node_size / 2.0
         fixed_nodes = [
             node for node in (
                 self.fixed_bezier_start_node(), self.fixed_bezier_end_node()
@@ -955,12 +1411,18 @@ class extended_patch(QGraphicsPathItem):
             if any(node is fixed_node for fixed_node in fixed_nodes):
                 continue
             painter.drawEllipse(
-                node.position.x() - 3, node.position.y() - 3, 6, 6
+                node.position.x() - preview_node_radius,
+                node.position.y() - preview_node_radius,
+                preview_node_size,
+                preview_node_size,
             )
         for row in self.preview_node_rows[1:-1]:
             for node in row:
                 painter.drawEllipse(
-                    node.position.x() - 3, node.position.y() - 3, 6, 6
+                    node.position.x() - preview_node_radius,
+                    node.position.y() - preview_node_radius,
+                    preview_node_size,
+                    preview_node_size,
                 )
         if self.one_cap_topology is not None and not self.outer_nodes:
             fixed_node = (
@@ -968,9 +1430,10 @@ class extended_patch(QGraphicsPathItem):
                 or self.one_cap_topology.outer_end_node
             )
             painter.drawEllipse(
-                fixed_node.position.x() - 3,
-                fixed_node.position.y() - 3,
-                6, 6,
+                fixed_node.position.x() - preview_node_radius,
+                fixed_node.position.y() - preview_node_radius,
+                preview_node_size,
+                preview_node_size,
             )
 
 
@@ -984,6 +1447,11 @@ class this_view(QGraphicsView):
         self.selected_point = None
         self.dragged_node = None
         self.pending_main_uv_index = None
+        self.pending_radial_layers = 1
+        self.pending_bezier_mode = False
+        self.patch_controls = None
+        self.document_modified = False
+        self.document_window = None
         self.current_patch = None
         self.current_extended_patch = None
         self.selected_edges = []
@@ -994,15 +1462,22 @@ class this_view(QGraphicsView):
     def grid_bounding_rect(self):
         """Return scene bounds for active mesh geometry, excluding previews."""
         grid_rect = None
-        for element in globals().get("element_list", []):
-            if not getattr(element, "active", True):
-                continue
-            element_rect = element.mapRectToScene(element.boundingRect())
-            grid_rect = (
-                QRectF(element_rect)
-                if grid_rect is None
-                else grid_rect.united(element_rect)
-            )
+        background = globals().get("static_mesh")
+        if graphics_item_in_scene(background, self.scene()):
+            grid_rect = background.mapRectToScene(background.boundingRect())
+        else:
+            for element in globals().get("element_list", []):
+                if (
+                    not getattr(element, "active", True)
+                    or not isinstance(element, QGraphicsItem)
+                ):
+                    continue
+                element_rect = element.mapRectToScene(element.boundingRect())
+                grid_rect = (
+                    QRectF(element_rect)
+                    if grid_rect is None
+                    else grid_rect.united(element_rect)
+                )
 
         active_nodes = [
             node for node in globals().get("node_list", [])
@@ -1070,7 +1545,7 @@ class this_view(QGraphicsView):
 
     def clear_selection(self):
         for edge in self.selected_edges:
-            edge.setPen(QPen(Qt.yellow, 3.0))
+            edge.setPen(boundary_edge_pen())
             edge.update()
         self.selected_edges = []
         for element in self.selected_elements:
@@ -1095,6 +1570,226 @@ class this_view(QGraphicsView):
             self.scene().removeItem(self.current_extended_patch)
         self.current_extended_patch = None
         self.pending_main_uv_index = None
+        self.pending_bezier_mode = False
+        self.update_patch_controls()
+
+    def set_patch_status(self, message):
+        if self.patch_controls is not None:
+            self.patch_controls.set_status(message)
+
+    def mark_document_modified(self):
+        self.document_modified = True
+        if self.document_window is not None:
+            self.document_window.update_window_title()
+
+    def update_patch_controls(self):
+        if self.patch_controls is not None:
+            self.patch_controls.update_from_view()
+
+    def set_pending_main_uv_index(self, value):
+        if value not in (None, 1, 2):
+            raise ValueError("Extended-patch main direction must be Auto, 1, or 2")
+        self.pending_main_uv_index = value
+        if value is not None:
+            print("extended patch pending main uv_index:", value)
+        self.update_patch_controls()
+
+    def set_extended_radial_layers(self, nr):
+        if not 1 <= nr <= 9:
+            raise ValueError("Radial layer count must be between 1 and 9")
+        patch = self.current_extended_patch
+        if patch is None:
+            self.pending_radial_layers = nr
+        else:
+            topology = patch.one_cap_topology or patch.capped_gap
+            has_caps = topology is not None and bool(
+                getattr(topology, "start_cap_edges", [])
+                or getattr(topology, "end_cap_edges", [])
+            )
+            patch.set_radial_layers(nr)
+            if not has_caps:
+                self.pending_radial_layers = nr
+            print("extended patch radial layers:", patch.radial_layers)
+        self.update_patch_controls()
+
+    def set_pending_bezier_mode(self, enabled):
+        self.pending_bezier_mode = bool(enabled)
+        self.update_patch_controls()
+
+    def enable_current_patch_bezier(self):
+        if self.current_extended_patch is None:
+            print("Start an extended patch before enabling Bézier mode")
+            self.set_patch_status("Start an extended patch first")
+            self.update_patch_controls()
+            return False
+        self.current_extended_patch.enable_bezier_mode()
+        self.pending_bezier_mode = True
+        self.set_patch_status("Bézier enabled")
+        self.update_patch_controls()
+        return True
+
+    def commit_current_patch(self):
+        print("convert patch to nodes and elements")
+        if self.current_extended_patch is not None:
+            add_extended_patch_to_nodes_elements(self.current_extended_patch)
+            committed = self.current_extended_patch is None
+            if committed:
+                rebuild_graphics_layers()
+                self.pending_main_uv_index = None
+                self.pending_bezier_mode = False
+                self.set_patch_status("Patch committed")
+                self.mark_document_modified()
+            self.update_patch_controls()
+            return committed
+        if self.current_patch is None:
+            print("No valid patch has been defined")
+            self.set_patch_status("No patch to commit")
+            self.update_patch_controls()
+            return False
+        add_patch_to_nodes_elements(self.current_patch)
+        rebuild_graphics_layers()
+        self.mark_document_modified()
+        self.update_patch_controls()
+        return True
+
+    def cancel_current_operation(self):
+        self.clear_selection()
+        self.set_patch_status("Ready")
+        self.update_patch_controls()
+
+    def create_extended_patch_preview(self):
+        boundary_topology = None
+        ambiguous_topology = False
+        for edge in self.selected_edges:
+            print(
+                "selected edge:", edge.vertices,
+                "uv =", edge.uv_index,
+                "element =", edge.element_index,
+                "side =", getattr(edge, "element_side", None),
+            )
+        main_uv_index = self.pending_main_uv_index
+        if main_uv_index is not None:
+            print("extended patch main uv_index:", main_uv_index)
+        try:
+            boundary_topology = ordered_extended_boundary_topology(
+                self.selected_edges, main_uv_index=main_uv_index
+            )
+        except ValueError as error:
+            print("extended topology detection failed:", error)
+            if (
+                main_uv_index is None
+                and "Ambiguous extended patch" in str(error)
+            ):
+                ambiguous_topology = True
+                print(
+                    "Press 1 or 2 to choose the extended-patch main "
+                    "boundary direction, then press E again"
+                )
+                self.set_patch_status(
+                    "Ambiguous boundary: choose Direction 1 or 2"
+                )
+            else:
+                self.set_patch_status(str(error))
+            boundary_topology = None
+        if boundary_topology is not None:
+            ordered_nodes = boundary_topology.inner_nodes
+            ordered_edges = boundary_topology.inner_edges
+        else:
+            if len({edge.uv_index for edge in self.selected_edges}) > 1:
+                print(
+                    "Extended topology with perpendicular side edges "
+                    "was not recognized; patch creation aborted"
+                )
+                self.update_patch_controls()
+                return False
+            selection_error = validate_boundary_chain(self.selected_edges)
+            if selection_error:
+                print(selection_error)
+                if not self.selected_edges:
+                    self.set_patch_status("Select boundary edges")
+                elif not ambiguous_topology:
+                    self.set_patch_status(selection_error)
+                self.update_patch_controls()
+                return False
+            ordered_nodes, ordered_edges = ordered_edge_chain(
+                self.selected_edges
+            )
+        if (
+            boundary_topology is not None
+            and boundary_topology.start_cap_edges
+            and boundary_topology.end_cap_edges
+        ):
+            topology_error = two_cap_topology_error(
+                boundary_topology, ordered_nodes
+            )
+            if topology_error:
+                print(topology_error)
+                self.set_patch_status(topology_error)
+                self.update_patch_controls()
+                return False
+        if (
+            self.current_patch is not None
+            and isinstance(self.current_patch, QGraphicsItem)
+        ):
+            self.scene().removeItem(self.current_patch)
+        self.current_patch = None
+        if (
+            self.current_extended_patch is not None
+            and isinstance(self.current_extended_patch, QGraphicsItem)
+        ):
+            self.scene().removeItem(self.current_extended_patch)
+        self.current_extended_patch = extended_patch(
+            ordered_nodes, ordered_edges, can_commit=True,
+        )
+        if (
+            boundary_topology is not None
+            and boundary_topology.start_cap_edge is not None
+            and boundary_topology.end_cap_edge is not None
+        ):
+            self.current_extended_patch.capped_gap = boundary_topology
+            self.current_extended_patch.radial_layers = len(
+                boundary_topology.start_cap_edges
+            )
+            segment_count = len(ordered_edges)
+            start = boundary_topology.outer_start_node.position
+            end = boundary_topology.outer_end_node.position
+            self.current_extended_patch.set_outer_positions(
+                interpolate_positions(start, end, segment_count)
+            )
+        elif (
+            boundary_topology is not None
+            and (
+                boundary_topology.start_cap_edge is not None
+                or boundary_topology.end_cap_edge is not None
+            )
+        ):
+            self.current_extended_patch.one_cap_topology = boundary_topology
+            cap_edges = (
+                boundary_topology.start_cap_edges
+                or boundary_topology.end_cap_edges
+            )
+            self.current_extended_patch.radial_layers = len(cap_edges)
+            self.current_extended_patch.redraw()
+        else:
+            self.current_extended_patch.set_radial_layers(
+                self.pending_radial_layers
+            )
+        self.scene().addItem(self.current_extended_patch)
+        self.pending_main_uv_index = None
+        print(
+            "extended patch ordered node indices:",
+            [node.index for node in ordered_nodes],
+        )
+        print(
+            "extended patch ordered edge vertex pairs:",
+            [list(edge.vertices) for edge in ordered_edges],
+        )
+        self.set_patch_status("Preview created")
+        if self.pending_bezier_mode:
+            self.enable_current_patch_bezier()
+        else:
+            self.update_patch_controls()
+        return True
 
 
     def keyPressEvent(self, event):
@@ -1108,164 +1803,36 @@ class this_view(QGraphicsView):
             and Qt.Key_1 <= event.key() <= Qt.Key_9
         ):
             nr = event.key() - Qt.Key_0
-            self.current_extended_patch.set_radial_layers(nr)
-            print("extended patch radial layers:", nr)
+            self.set_extended_radial_layers(nr)
             return
         if (
             self.current_extended_patch is None
             and event.key() in (Qt.Key_1, Qt.Key_2)
         ):
-            self.pending_main_uv_index = event.key() - Qt.Key_0
-            print(
-                "extended patch pending main uv_index:",
-                self.pending_main_uv_index,
-            )
+            self.set_pending_main_uv_index(event.key() - Qt.Key_0)
             return
         if event.key() == Qt.Key_Escape:
-            self.clear_selection()
+            self.cancel_current_operation()
             return
         if event.key() == 85:    #   u
             print("resetting zoom_level to 1")
             self.zoom_level = 1. 
             self.setTransform(QTransform().scale(self.zoom_level, self.zoom_level))
         if event.key() == 80:    #   p
-            print("convert patch to nodes and elements")
-            if self.current_extended_patch is not None:
-                add_extended_patch_to_nodes_elements(
-                    self.current_extended_patch
-                )
-                return
-            if self.current_patch is None:
-                print("No valid patch has been defined")
-                return
-            add_patch_to_nodes_elements(self.current_patch)
+            self.commit_current_patch()
+            return
 
         if event.key() == Qt.Key_B:
-            if self.current_extended_patch is None:
-                print("Start an extended patch before enabling Bézier mode")
-                return
-            self.current_extended_patch.enable_bezier_mode()
+            self.enable_current_patch_bezier()
             return
 
         if event.key() == Qt.Key_E:
-            boundary_topology = None
-            for edge in self.selected_edges:
-                print(
-                    "selected edge:",
-                    edge.vertices,
-                    "uv =", edge.uv_index,
-                    "element =", edge.element_index,
-                    "side =", getattr(edge, "element_side", None),
-                )
-            main_uv_index = self.pending_main_uv_index
-            if main_uv_index is not None:
-                print("extended patch main uv_index:", main_uv_index)
-            try:
-                boundary_topology = ordered_extended_boundary_topology(
-                    self.selected_edges, main_uv_index=main_uv_index
-                )
-            except ValueError as error:
-                print("extended topology detection failed:", error)
-                if (
-                    main_uv_index is None
-                    and "Ambiguous extended patch" in str(error)
-                ):
-                    print(
-                        "Press 1 or 2 to choose the extended-patch main "
-                        "boundary direction, then press E again"
-                    )
-                boundary_topology = None
-            if boundary_topology is not None:
-                ordered_nodes = boundary_topology.inner_nodes
-                ordered_edges = boundary_topology.inner_edges
-            else:
-                if len({edge.uv_index for edge in self.selected_edges}) > 1:
-                    print(
-                        "Extended topology with perpendicular side edges "
-                        "was not recognized; patch creation aborted"
-                    )
-                    return
-                selection_error = validate_boundary_chain(self.selected_edges)
-                if selection_error:
-                    print(selection_error)
-                    return
-                ordered_nodes, ordered_edges = ordered_edge_chain(
-                    self.selected_edges
-                )
-            if (
-                boundary_topology is not None
-                and boundary_topology.start_cap_edges
-                and boundary_topology.end_cap_edges
-            ):
-                topology_error = two_cap_topology_error(
-                    boundary_topology, ordered_nodes
-                )
-                if topology_error:
-                    print(topology_error)
-                    return
-            if (
-                self.current_patch is not None
-                and isinstance(self.current_patch, QGraphicsItem)
-            ):
-                self.scene().removeItem(self.current_patch)
-            self.current_patch = None
-            if (
-                self.current_extended_patch is not None
-                and isinstance(self.current_extended_patch, QGraphicsItem)
-            ):
-                self.scene().removeItem(self.current_extended_patch)
-            self.current_extended_patch = extended_patch(
-                ordered_nodes, ordered_edges,
-                can_commit=True,
-            )
-            if (
-                boundary_topology is not None
-                and boundary_topology.start_cap_edge is not None
-                and boundary_topology.end_cap_edge is not None
-            ):
-                self.current_extended_patch.capped_gap = boundary_topology
-                self.current_extended_patch.radial_layers = len(
-                    boundary_topology.start_cap_edges
-                )
-                segment_count = len(ordered_edges)
-                start = boundary_topology.outer_start_node.position
-                end = boundary_topology.outer_end_node.position
-                outer_positions = interpolate_positions(
-                    start, end, segment_count
-                )
-                self.current_extended_patch.set_outer_positions(
-                    outer_positions
-                )
-            elif (
-                boundary_topology is not None
-                and (
-                    boundary_topology.start_cap_edge is not None
-                    or boundary_topology.end_cap_edge is not None
-                )
-            ):
-                self.current_extended_patch.one_cap_topology = (
-                    boundary_topology
-                )
-                cap_edges = (
-                    boundary_topology.start_cap_edges
-                    or boundary_topology.end_cap_edges
-                )
-                self.current_extended_patch.radial_layers = len(cap_edges)
-                self.current_extended_patch.redraw()
-            self.scene().addItem(self.current_extended_patch)
-            self.pending_main_uv_index = None
-            print(
-                "extended patch ordered node indices:",
-                [node.index for node in ordered_nodes],
-            )
-            print(
-                "extended patch ordered edge vertex pairs:",
-                [list(edge.vertices) for edge in ordered_edges],
-            )
+            self.create_extended_patch_preview()
             return
 
         if event.key() == Qt.Key_Delete:
             delete_selected_element(self)
+            self.update_patch_controls()
             return
 
     def mousePressEvent(self, event):        
@@ -1277,6 +1844,7 @@ class this_view(QGraphicsView):
                     self.mapToScene(event.pos())
                 ):
                     print("All extended-patch outer points have been defined")
+                self.update_patch_controls()
                 return
             if len(self.selected_edges) == 3:
                 if self.current_patch is None:
@@ -1327,7 +1895,7 @@ class this_view(QGraphicsView):
                     event.accept()
                     return
                 if (
-                    type(item) == type(node_list[0])
+                    isinstance(item, jorek_node_item)
                     and getattr(item, "active", True)
                 ):
                     self.dragged_node = item
@@ -1356,10 +1924,12 @@ class this_view(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if self.selected_point:
             self.selected_point = None
+            rebuild_static_mesh_path(self.scene())
             event.accept()
             return
         if self.dragged_node is not None:
             self.dragged_node = None
+            rebuild_static_mesh_path(self.scene())
             event.accept()
             return
         modifiers = QApplication.keyboardModifiers()
@@ -1378,7 +1948,7 @@ class this_view(QGraphicsView):
             self.selected_nodes = []
             for item in items:
                 if (
-                    type(item) == type(node_list[0])
+                    isinstance(item, jorek_node_item)
                     and getattr(item, "active", True)
                 ):
                     if item.boundary:
@@ -1408,7 +1978,8 @@ class this_view(QGraphicsView):
                     if item not in self.selected_edges:
                         print("selected boundary edge : ",item.element_index,item.element_side,item.vertices)
                         self.selected_edges.append(item)
-                    item.setPen(QPen(Qt.green, 2.))
+                    item.setPen(boundary_edge_pen(Qt.green, 2.5))
+            self.update_patch_controls()
 
         else:
             if not zoom_rect.isEmpty():
@@ -1423,6 +1994,413 @@ class this_view(QGraphicsView):
 
                 self.start_point = None
                 self.end_point   = None
+
+
+class extended_patch_controls(QGroupBox):
+    """Compact controls for the existing extended-patch view state machine."""
+    def __init__(self, view=None, parent=None):
+        super().__init__("Extended patch", parent)
+        self.view = None
+        self._updating = False
+        self.status_message = "Ready"
+        self.setFixedWidth(250)
+
+        layout = QVBoxLayout(self)
+        self.selection_label = QLabel("Selection:\n0 boundary edges")
+        self.selection_label.setWordWrap(True)
+        layout.addWidget(self.selection_label)
+
+        layout.addWidget(QLabel("Main direction:"))
+        self.main_direction_combo = QComboBox()
+        self.main_direction_combo.addItem("Auto", None)
+        self.main_direction_combo.addItem("Direction 1 (u)", 1)
+        self.main_direction_combo.addItem("Direction 2 (v)", 2)
+        layout.addWidget(self.main_direction_combo)
+
+        layout.addWidget(QLabel("Radial layers:"))
+        self.radial_layers_spin = QSpinBox()
+        self.radial_layers_spin.setRange(1, 9)
+        layout.addWidget(self.radial_layers_spin)
+        self.radial_note_label = QLabel("")
+        layout.addWidget(self.radial_note_label)
+
+        layout.addWidget(QLabel("Outer boundary:"))
+        self.outer_boundary_combo = QComboBox()
+        self.outer_boundary_combo.addItem("Straight", False)
+        self.outer_boundary_combo.addItem("Bézier", True)
+        layout.addWidget(self.outer_boundary_combo)
+
+        self.preview_button = QPushButton("Create / Preview")
+        self.bezier_button = QPushButton("Enable Bézier")
+        self.commit_button = QPushButton("Commit")
+        self.cancel_button = QPushButton("Cancel")
+        layout.addWidget(self.preview_button)
+        layout.addWidget(self.bezier_button)
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.commit_button)
+        button_row.addWidget(self.cancel_button)
+        layout.addLayout(button_row)
+        layout.addStretch(1)
+
+        self.status_label = QLabel("Status: Ready")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.main_direction_combo.currentIndexChanged.connect(
+            self._main_direction_changed
+        )
+        self.radial_layers_spin.valueChanged.connect(
+            self._radial_layers_changed
+        )
+        self.outer_boundary_combo.currentIndexChanged.connect(
+            self._outer_boundary_changed
+        )
+        self.preview_button.clicked.connect(self._create_preview)
+        self.bezier_button.clicked.connect(self._enable_bezier)
+        self.commit_button.clicked.connect(self._commit)
+        self.cancel_button.clicked.connect(self._cancel)
+        if view is not None:
+            self.attach_view(view)
+        else:
+            self.update_from_view()
+
+    def attach_view(self, view):
+        if self.view is not None and self.view.patch_controls is self:
+            self.view.patch_controls = None
+        self.view = view
+        view.patch_controls = self
+        self.update_from_view()
+
+    def set_status(self, message):
+        self.status_message = message
+        self.status_label.setText("Status: " + message)
+
+    def _active_topology(self):
+        if self.view is None or self.view.current_extended_patch is None:
+            return None
+        patch = self.view.current_extended_patch
+        return patch.one_cap_topology or patch.capped_gap
+
+    def _has_cap_chain(self):
+        topology = self._active_topology()
+        return topology is not None and bool(
+            getattr(topology, "start_cap_edges", [])
+            or getattr(topology, "end_cap_edges", [])
+        )
+
+    def _selection_summary(self):
+        if self.view is None:
+            return "Selection:\n0 boundary edges"
+        patch = self.view.current_extended_patch
+        if patch is None:
+            return "Selection:\n{} boundary edges".format(
+                len(self.view.selected_edges or [])
+            )
+        lines = ["Selection:", "{} main edges".format(len(patch.ordered_edges))]
+        topology = patch.one_cap_topology or patch.capped_gap
+        if topology is None:
+            lines.append("no caps")
+        else:
+            start_count = len(getattr(topology, "start_cap_edges", []))
+            end_count = len(getattr(topology, "end_cap_edges", []))
+            if start_count and end_count:
+                lines.append("two caps: {} + {} edges".format(
+                    start_count, end_count
+                ))
+            else:
+                lines.append("one cap: {} edges".format(
+                    start_count or end_count
+                ))
+        lines.append("{} radial layers".format(patch.radial_layers))
+        lines.append("main direction: {}".format(patch.main_uv_index()))
+        return "\n".join(lines)
+
+    def update_from_view(self):
+        self._updating = True
+        try:
+            if self.view is None:
+                self.setEnabled(False)
+                return
+            self.setEnabled(True)
+            patch = self.view.current_extended_patch
+            self.selection_label.setText(self._selection_summary())
+
+            direction = (
+                patch.main_uv_index()
+                if patch is not None else self.view.pending_main_uv_index
+            )
+            direction_index = {None: 0, 1: 1, 2: 2}[direction]
+            self.main_direction_combo.setCurrentIndex(direction_index)
+            self.main_direction_combo.setEnabled(patch is None)
+
+            radial_layers = (
+                patch.radial_layers
+                if patch is not None else self.view.pending_radial_layers
+            )
+            self.radial_layers_spin.setValue(radial_layers)
+            cap_fixed = patch is not None and self._has_cap_chain()
+            self.radial_layers_spin.setEnabled(not cap_fixed)
+            self.radial_note_label.setText(
+                "(fixed by cap chain)" if cap_fixed else ""
+            )
+
+            bezier_active = patch is not None and patch.bezier_mode
+            desired_bezier = (
+                bezier_active
+                or (patch is None and self.view.pending_bezier_mode)
+            )
+            self.outer_boundary_combo.setCurrentIndex(
+                1 if desired_bezier else 0
+            )
+            self.outer_boundary_combo.setEnabled(patch is None)
+            self.preview_button.setEnabled(patch is None)
+            self.bezier_button.setEnabled(
+                patch is not None and not bezier_active
+            )
+            self.commit_button.setEnabled(patch is not None)
+        finally:
+            self._updating = False
+
+    def _main_direction_changed(self, unused_index):
+        if not self._updating and self.view is not None:
+            self.view.set_pending_main_uv_index(
+                self.main_direction_combo.currentData()
+            )
+
+    def _radial_layers_changed(self, value):
+        if not self._updating and self.view is not None:
+            self.view.set_extended_radial_layers(value)
+
+    def _outer_boundary_changed(self, unused_index):
+        if not self._updating and self.view is not None:
+            self.view.set_pending_bezier_mode(bool(
+                self.outer_boundary_combo.currentData()
+            ))
+
+    def _create_preview(self):
+        if self.view is not None:
+            self.view.create_extended_patch_preview()
+
+    def _enable_bezier(self):
+        if self.view is not None:
+            self.view.enable_current_patch_bezier()
+
+    def _commit(self):
+        if self.view is not None:
+            self.view.commit_current_patch()
+
+    def _cancel(self):
+        if self.view is not None:
+            self.view.cancel_current_operation()
+
+
+class grid_editor_window(QMainWindow):
+    def __init__(self, graphics_view=None, parent=None):
+        super().__init__(parent)
+        self.view = graphics_view or this_view()
+        self.view.document_window = self
+        self.current_filename = None
+        self.source_is_grid_only = True
+        self.patch_controls = extended_patch_controls(self.view)
+        central_widget = QWidget(self)
+        layout = QHBoxLayout(central_widget)
+        layout.setContentsMargins(4, 4, 4, 4)
+        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.view, 1)
+        layout.addWidget(self.patch_controls, 0)
+        self.setCentralWidget(central_widget)
+        self._create_file_menu()
+        self.update_window_title()
+
+    def _create_file_menu(self):
+        file_menu = self.menuBar().addMenu("&File")
+        self.open_action = QAction("&Open...", self)
+        self.open_action.setShortcut("Ctrl+O")
+        self.open_action.triggered.connect(self.open_grid_dialog)
+        file_menu.addAction(self.open_action)
+        self.save_action = QAction("&Save", self)
+        self.save_action.setShortcut("Ctrl+S")
+        self.save_action.triggered.connect(self.save_grid_from_menu)
+        file_menu.addAction(self.save_action)
+        self.save_as_action = QAction("Save &As...", self)
+        self.save_as_action.setShortcut("Ctrl+Shift+S")
+        self.save_as_action.triggered.connect(self.save_grid_as_dialog)
+        file_menu.addAction(self.save_as_action)
+        file_menu.addSeparator()
+        self.exit_action = QAction("E&xit", self)
+        self.exit_action.triggered.connect(self.close)
+        file_menu.addAction(self.exit_action)
+
+    def update_window_title(self):
+        title = "JOREK Grid Editor"
+        if self.current_filename:
+            title += " — " + os.path.basename(self.current_filename)
+        if self.view.document_modified:
+            title += " *"
+        self.setWindowTitle(title)
+
+    def _report_file_error(self, title, error, interactive):
+        message = str(error)
+        print(title + ":", message)
+        self.view.set_patch_status(message)
+        if interactive:
+            QMessageBox.critical(self, title, message)
+
+    def open_grid_file(self, filename, interactive=False):
+        global jorek, scene, view, node_list, element_list, boundary_list
+        global _diagnostic_nodes_xx_before
+        old_state = (
+            globals().get("jorek"), globals().get("scene"), globals().get("view"),
+            globals().get("node_list"), globals().get("element_list"),
+            globals().get("boundary_list"), self.view.scene(),
+        )
+        try:
+            new_grid = jorek_grid(id_generator()).read_grid_hdf5(filename)
+            if DIAGNOSTIC_BASIS_SCALE:
+                _diagnostic_nodes_xx_before = new_grid.nodes_xx.copy()
+            report_grid_array_memory(new_grid)
+            report_basis_scale_diagnostics(new_grid)
+            report_memory("after HDF5 read")
+            (
+                new_scene, new_nodes, new_elements, new_boundaries,
+            ) = build_grid_scene(new_grid, this_scaling)
+            verify_diagnostic_grid_unchanged(new_grid, "after construction")
+        except Exception as error:
+            (
+                jorek, scene, view, node_list, element_list, boundary_list,
+                old_view_scene,
+            ) = old_state
+            if old_view_scene is not None:
+                self.view.setScene(old_view_scene)
+            self._report_file_error("Could not open grid", error, interactive)
+            return False
+
+        jorek = new_grid
+        scene = new_scene
+        view = self.view
+        node_list = new_nodes
+        element_list = new_elements
+        boundary_list = new_boundaries
+        self.view.setScene(scene)
+        report_memory("after setScene")
+        self.view.rubberBand = None
+        self.view.start_point = None
+        self.view.end_point = None
+        self.view.selected_point = None
+        self.view.dragged_node = None
+        self.view.selected_edges = []
+        self.view.selected_nodes = []
+        self.view.selected_elements = []
+        self.view.current_patch = None
+        self.view.current_extended_patch = None
+        self.view.pending_main_uv_index = None
+        self.view.pending_radial_layers = 1
+        self.view.pending_bezier_mode = False
+        self.current_filename = os.path.abspath(filename)
+        self.source_is_grid_only = new_grid.grid_only_source
+        self.view.document_modified = False
+        self.view.set_patch_status("Grid opened")
+        self.view.update_patch_controls()
+        self.view.fit_grid_to_window()
+        report_memory("after fit")
+        self.update_window_title()
+        return True
+
+    def save_grid_file(self, filename=None, interactive=False):
+        destination = filename or self.current_filename
+        if destination is None:
+            if interactive:
+                return self.save_grid_as_dialog()
+            return False
+        destination = os.path.abspath(destination)
+        if (
+            not self.source_is_grid_only
+            and self.current_filename is not None
+            and destination == os.path.abspath(self.current_filename)
+        ):
+            message = (
+                "The original file contains simulation data. Use Save As "
+                "to write the edited grid without overwriting the restart."
+            )
+            self._report_file_error("Save requires Save As", message, interactive)
+            return False
+        try:
+            nodes_xx, boundary, vertices, element_sizes = live_grid_arrays()
+            destination_directory = os.path.dirname(destination) or os.curdir
+            os.makedirs(destination_directory, exist_ok=True)
+            descriptor, temporary_filename = tempfile.mkstemp(
+                prefix=".jorek_grid_", suffix=".h5",
+                dir=destination_directory,
+            )
+            os.close(descriptor)
+            try:
+                globals()["jorek"].write_grid_hdf5(
+                    temporary_filename, nodes_xx, boundary,
+                    vertices, element_sizes,
+                )
+                os.replace(temporary_filename, destination)
+            finally:
+                if os.path.exists(temporary_filename):
+                    os.remove(temporary_filename)
+        except Exception as error:
+            self._report_file_error("Could not save grid", error, interactive)
+            return False
+        self.current_filename = destination
+        self.source_is_grid_only = True
+        self.view.document_modified = False
+        self.view.set_patch_status("Grid saved")
+        self.update_window_title()
+        return True
+
+    def open_grid_dialog(self):
+        if not self.maybe_save_changes():
+            return False
+        filename, unused_filter = QFileDialog.getOpenFileName(
+            self, "Open JOREK grid", "jorek*.h5",
+            "JOREK HDF5 files (*.h5 *.hdf5);;All files (*)",
+        )
+        return bool(filename) and self.open_grid_file(filename, interactive=True)
+
+    def save_grid_from_menu(self):
+        return self.save_grid_file(interactive=True)
+
+    def save_grid_as_dialog(self):
+        if self.current_filename:
+            base, unused_extension = os.path.splitext(self.current_filename)
+            suggested = base + "_edited.h5"
+        else:
+            suggested = "jorek_grid_edited.h5"
+        filename, unused_filter = QFileDialog.getSaveFileName(
+            self, "Save JOREK grid", suggested,
+            "JOREK HDF5 files (*.h5 *.hdf5);;All files (*)",
+        )
+        if not filename:
+            return False
+        if not os.path.splitext(filename)[1]:
+            filename += ".h5"
+        return self.save_grid_file(filename, interactive=True)
+
+    def maybe_save_changes(self):
+        if not self.view.document_modified:
+            return True
+        choice = QMessageBox.warning(
+            self, "Unsaved changes",
+            "The grid has unsaved changes.",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if choice == QMessageBox.Cancel:
+            return False
+        if choice == QMessageBox.Discard:
+            return True
+        return self.save_grid_file(interactive=True)
+
+    def closeEvent(self, event):
+        if self.maybe_save_changes():
+            event.accept()
+        else:
+            event.ignore()
+
 
 class big_patch_node(QGraphicsItem):
     def __init__(self,position):
@@ -1530,6 +2508,84 @@ def signed_edge_sizes(edge_nodes, uv_index):
         edge_nodes[1].xx[:,uv_index],
     ))
     return edge_sizes
+
+
+def inherited_transverse_endpoint_size(
+    inner_edge, existing_node, new_outer_position,
+):
+    """Orient the inner owner's transverse scale into a new radial cell."""
+    if not getattr(inner_edge, "active", True):
+        raise ValueError("Inner boundary edge must be active")
+    owner = element_by_index(inner_edge.element_index)
+    if owner is None or not getattr(owner, "active", True):
+        raise ValueError(
+            "Inner boundary edge has no active owning element"
+        )
+
+    endpoint_matches = [
+        endpoint for endpoint, node in enumerate(inner_edge.nodes)
+        if node is existing_node or node.index == existing_node.index
+    ]
+    if len(endpoint_matches) != 1:
+        raise ValueError(
+            "Existing node must be exactly one endpoint of the inner edge"
+        )
+    endpoint = endpoint_matches[0]
+
+    local_nodes_index = list(inner_edge.local_nodes_index or [])
+    if len(local_nodes_index) == 2:
+        local_vertex = local_nodes_index[endpoint]
+        if (
+            local_vertex < 0
+            or local_vertex >= len(owner.vertices)
+            or owner.vertices[local_vertex] != existing_node.index
+        ):
+            raise ValueError(
+                "Inner edge endpoint metadata does not match its owning element"
+            )
+    else:
+        owner_matches = [
+            local_vertex
+            for local_vertex, vertex in enumerate(owner.vertices)
+            if vertex == existing_node.index
+        ]
+        if len(owner_matches) != 1:
+            raise ValueError(
+                "Existing node does not map uniquely to the inner owner"
+            )
+        local_vertex = owner_matches[0]
+
+    if inner_edge.uv_index not in (1, 2):
+        raise ValueError("Inner boundary edge uv_index must be 1 or 2")
+    perp_uv = inner_edge.uv_index % 2 + 1
+    old_size = float(owner.sizes[perp_uv, local_vertex])
+    if not np.isfinite(old_size) or old_size == 0.0:
+        raise ValueError(
+            "Inner owner transverse size must be finite and nonzero"
+        )
+
+    raw_basis = np.asarray(existing_node.xx[:, perp_uv], dtype=float)
+    if (
+        not np.all(np.isfinite(raw_basis))
+        or np.linalg.norm(raw_basis) == 0.0
+    ):
+        raise ValueError(
+            "Existing node transverse basis must be finite and nonzero"
+        )
+    radial_direction = (
+        np_point(new_outer_position) - np_point(existing_node.position)
+    )
+    if (
+        not np.all(np.isfinite(radial_direction))
+        or np.linalg.norm(radial_direction) == 0.0
+    ):
+        raise ValueError("New transverse edge direction must be finite and nonzero")
+    orientation = float(np.inner(raw_basis, radial_direction))
+    if not np.isfinite(orientation) or orientation == 0.0:
+        raise ValueError(
+            "Existing transverse basis cannot be oriented toward the new node"
+        )
+    return math.copysign(abs(old_size), orientation)
 
 
 def bezier_nodal_parameter_scales(parameters):
@@ -2548,8 +3604,10 @@ def _add_single_element_patch_to_nodes_elements(patch):
 # create one new node, two new edges with the new node and the not_shared selected edge nodes.
     if len(edges) == 2:
 
+        inner_edge = patch.edges[0]
+        transverse_edge = patch.edges[1]
         shared_node, outer_node0, outer_node1 = two_edge_corner_nodes(
-            patch.edges[0], patch.edges[1]
+            inner_edge, transverse_edge
         )
         print("two edges forming a corner ", shared_node.index)
 
@@ -2558,8 +3616,12 @@ def _add_single_element_patch_to_nodes_elements(patch):
         direction_0 = outer_node0.xx[:,0] - np_point(patch.corner_nodes[0].position)
         direction_1 = outer_node1.xx[:,0] - np_point(patch.corner_nodes[0].position)
 
-        perp_index_0 = patch.edges[0].uv_index%2  + 1
-        perp_index_1 = patch.edges[1].uv_index%2  + 1
+        perp_index_0 = inner_edge.uv_index%2  + 1
+        perp_index_1 = transverse_edge.uv_index%2  + 1
+        if transverse_edge.uv_index != perp_index_0:
+            raise ValueError(
+                "Second edge must be transverse to the inner boundary edge"
+            )
 
         print(" direction_0 : ", outer_node0.index, patch.edges[0].uv_index)
         print(" direction_1 : ", outer_node1.index, patch.edges[1].uv_index)
@@ -2602,7 +3664,9 @@ def _add_single_element_patch_to_nodes_elements(patch):
 
         edge_sizes = np.zeros((2,2))   # order, vertex
         edge_sizes[0,:] = 1.
-        edge_sizes[1,0] = np.sign(np.inner(np_point(edge_nodes[1].position - edge_nodes[0].position), edge_nodes[0].xx[:,edge_uv_index]))
+        edge_sizes[1,0] = inherited_transverse_endpoint_size(
+            inner_edge, outer_node0, new_node.position
+        )
         edge_sizes[1,1] = np.sign(np.inner(np_point(edge_nodes[0].position - edge_nodes[1].position), edge_nodes[1].xx[:,edge_uv_index]))
         this_edge_2 = boundary_edge(edge_nodes, edge_vertices, [], None, None, edge_uv_index, edge_sizes)
         scene.addItem(this_edge_2)
@@ -2793,7 +3857,9 @@ def _add_single_element_patch_to_nodes_elements(patch):
 
         edge_sizes = np.zeros((2,2))   # order, vertex
         edge_sizes[0,:] = 1.
-        edge_sizes[1,0] = np.sign(np.inner(np_point(edge_nodes[1].position - edge_nodes[0].position), edge_nodes[0].xx[:,edge_uv_index]))
+        edge_sizes[1,0] = inherited_transverse_endpoint_size(
+            patch.edges[0], old_node1, new_at_node1.position
+        )
         edge_sizes[1,1] = np.sign(np.inner(np_point(edge_nodes[0].position - edge_nodes[1].position), edge_nodes[1].xx[:,edge_uv_index]))
     
         this_edge_2 = boundary_edge(edge_nodes, edge_vertices, [], None, None, perp_index, edge_sizes)
@@ -2807,7 +3873,9 @@ def _add_single_element_patch_to_nodes_elements(patch):
         edge_sizes = np.zeros((2,2))   # order, vertex
         edge_sizes[0,:] = 1.
         edge_sizes[1,0] = np.sign(np.inner(np_point(edge_nodes[1].position - edge_nodes[0].position), edge_nodes[0].xx[:,edge_uv_index]))
-        edge_sizes[1,1] = np.sign(np.inner(np_point(edge_nodes[0].position - edge_nodes[1].position), edge_nodes[1].xx[:,edge_uv_index]))
+        edge_sizes[1,1] = inherited_transverse_endpoint_size(
+            patch.edges[0], old_node0, new_at_node0.position
+        )
     
         this_edge_4 = boundary_edge(edge_nodes, edge_vertices, [], None, None, perp_index, edge_sizes)
         scene.addItem(this_edge_4)
@@ -2979,8 +4047,9 @@ def deactivate_node(node):
     node.connected_elements = []
     node.connected_boundary_edges = []
     node.active = False
-    node.setVisible(False)
-    node.setEnabled(False)
+    if isinstance(node, QGraphicsItem):
+        node.setVisible(False)
+        node.setEnabled(False)
 
 
 def deactivate_element(element):
@@ -2995,9 +4064,10 @@ def deactivate_element(element):
             if selected is not element
         ]
     element.active = False
-    element.setVisible(False)
-    element.setEnabled(False)
-    element.path_item.setVisible(False)
+    if isinstance(element, QGraphicsItem):
+        element.setVisible(False)
+        element.setEnabled(False)
+        element.path_item.setVisible(False)
 
 
 def deactivate_boundary_edge(edge):
@@ -3158,10 +4228,10 @@ def delete_selected_element(this_view):
     print("before recompute_node_boundaries", flush=True)
     recompute_node_boundaries(node_list, boundary_list)
     print("after recompute_node_boundaries", flush=True)
-    print("before rebuild_node_connections", flush=True)
-    rebuild_node_connections()
-    print("after rebuild_node_connections", flush=True)
-    scene.update()
+    print("before rebuild_graphics_layers", flush=True)
+    rebuild_graphics_layers()
+    print("after rebuild_graphics_layers", flush=True)
+    this_view.mark_document_modified()
 
 def order_edges(edges):
     ordered_edges = []
@@ -3191,6 +4261,69 @@ def np_point(qpointf):
 def qt_point(x):
     return QPointF(x[0].item(), x[1].item())
 
+
+class mesh_node_record:
+    """Non-graphics node record preserving node_list[index] semantics."""
+    def __init__(self, index, xx, boundary, active=True):
+        self.index = index
+        self.xx = np.asarray(xx)
+        self.position = QPointF(self.xx[0, 0], self.xx[1, 0])
+        self.boundary = boundary
+        self.active = active
+        self.connected_elements = []
+        self.connected_boundary_edges = []
+
+    def prepareGeometryChange(self):
+        pass
+
+    def update(self):
+        pass
+
+
+class mesh_element_record:
+    """Non-graphics topology record for a frozen interior element."""
+    def __init__(self, index, vertices, sizes, active=True):
+        self.index = index
+        self.vertices = np.asarray(vertices)
+        self.sizes = np.asarray(sizes)
+        self.active = active
+        self.edges = []
+
+    def update(self):
+        pass
+
+    def scene(self):
+        return None
+
+
+def editable_boundary_element_indices(elements, boundary_edges):
+    """Active elements owning at least one active boundary edge."""
+    active_indices = {
+        element.index for element in elements
+        if getattr(element, "active", True)
+    }
+    return {
+        edge.element_index for edge in boundary_edges
+        if (
+            getattr(edge, "active", True)
+            and edge.element_index in active_indices
+        )
+    }
+
+
+def editable_node_indices(elements, editable_element_indices):
+    """Union of vertices belonging to the editable element set."""
+    editable_element_indices = set(editable_element_indices)
+    return {
+        int(vertex)
+        for element in elements
+        if (
+            getattr(element, "active", True)
+            and element.index in editable_element_indices
+        )
+        for vertex in element.vertices
+    }
+
 def reversed_edge(edge):
     edge.vertices          = edge.vertices[::-1]
     edge.nodes             = edge.nodes[::-1] 
@@ -3204,9 +4337,72 @@ def reversed_edge(edge):
     return edge
 
 
+def node_display_reference(node):
+    """Return a deterministic active (element, local vertex) display owner.
+
+    Boundary-edge owners are preferred for boundary nodes.  Within either
+    candidate set, the element with the lowest persistent index wins.
+    """
+    candidates = []
+    for element in getattr(node, "connected_elements", []):
+        if not getattr(element, "active", True):
+            continue
+        local_vertices = [
+            local_vertex
+            for local_vertex, vertex in enumerate(element.vertices)
+            if vertex == node.index
+        ]
+        if local_vertices:
+            candidates.append((element, local_vertices[0]))
+    if not candidates:
+        return None
+
+    if node.boundary:
+        boundary_owner_indices = {
+            edge.element_index
+            for edge in getattr(node, "connected_boundary_edges", [])
+            if (
+                getattr(edge, "active", True)
+                and edge.element_index is not None
+                and node.index in edge.vertices
+            )
+        }
+        boundary_candidates = [
+            candidate for candidate in candidates
+            if candidate[0].index in boundary_owner_indices
+        ]
+        if boundary_candidates:
+            candidates = boundary_candidates
+
+    return min(
+        candidates,
+        key=lambda candidate: (candidate[0].index, candidate[1]),
+    )
+
+
+def node_basis_display_scale(node, basis_index):
+    """Return the owning element's signed nodal scale for one basis."""
+    if basis_index not in (1, 2):
+        raise ValueError("A displayed nodal basis index must be 1 or 2")
+    reference = node_display_reference(node)
+    if reference is None:
+        # Orphan/new nodes have no element-local parameter scale yet.
+        return 1.0
+    element, local_vertex = reference
+    return float(element.sizes[basis_index, local_vertex])
+
+
+def node_basis_display_vector(node, basis_index):
+    return (
+        node_basis_display_scale(node, basis_index)
+        * node.xx[:, basis_index]
+    )
+
+
 def rebuild_node_connections():
     """Cache the drawable items affected by changes to each node."""
     for node in node_list:
+        node.prepareGeometryChange()
         node.connected_elements = []
         node.connected_boundary_edges = []
 
@@ -3222,10 +4418,18 @@ def rebuild_node_connections():
         for vertex in edge.vertices:
             node_list[vertex].connected_boundary_edges.append(edge)
 
+    for node in node_list:
+        if not getattr(node, "active", True):
+            continue
+        if isinstance(node, jorek_node_item):
+            node.blue_handle.sync_position()
+            node.red_handle.sync_position()
+        node.update()
+
 class boundary_edge(QGraphicsPathItem):
     def __init__(self, nodes, vertices, local_nodes_index, element_index, element_side, uv_index, element_sizes):
         super().__init__()
-        self.setZValue(Z_MESH_EDGE)
+        self.setZValue(Z_BOUNDARY_EDGE)
         self.active = True
         self.vertices          = vertices
         self.nodes             = nodes 
@@ -3242,7 +4446,9 @@ class boundary_edge(QGraphicsPathItem):
 
         self.setFlag(QGraphicsItem.ItemIsMovable,False)
         self.setFlag(QGraphicsItem.ItemIsSelectable,True)
-        self.setPen(QPen(Qt.yellow, 3.))
+        self.setPen(boundary_edge_pen())
+        if DIAGNOSTIC_ELEMENTS_ONLY:
+            self.setVisible(False)
 
         self.setPath(self.createPath())
 
@@ -3266,11 +4472,86 @@ class boundary_edge(QGraphicsPathItem):
         painter.setPen(self.pen())
         painter.drawPath(self.path())
 
-        mid_edge = np.sum(self.points[:,0,:],1) / 2.
+        if SHOW_EDGE_INDICES:
+            mid_edge = np.sum(self.points[:,0,:],1) / 2.
+            painter.setPen(QPen(Qt.green))
+            painter.drawText(
+                qt_point(0.7 * self.points[:,0,0] + 0.3 * mid_edge), "1"
+            )
+            painter.drawText(
+                qt_point(0.7 * self.points[:,0,1] + 0.3 * mid_edge), "2"
+            )
 
-        painter.setPen(QPen(Qt.green))
-        painter.drawText(qt_point(0.7*self.points[:,0,0]+0.3*mid_edge),"1")
-        painter.drawText(qt_point(0.7*self.points[:,0,1]+0.3*mid_edge),"2")
+
+def scaled_element_points(vertices, sizes):
+    points = jorek.nodes_xx[:, :, vertices]
+    points[0, :, :] *= sizes
+    points[1, :, :] *= sizes
+    return points
+
+
+def element_outline_path(points):
+    bezier_points = element_bezier_points(points, this_scaling)
+    path = QPainterPath()
+    path.moveTo(qt_point(bezier_points[:, 0, 0]))
+    path.cubicTo(
+        qt_point(bezier_points[:, 1, 0]),
+        qt_point(bezier_points[:, 2, 0]),
+        qt_point(bezier_points[:, 3, 0]),
+    )
+    path.cubicTo(
+        qt_point(bezier_points[:, 3, 1]),
+        qt_point(bezier_points[:, 3, 2]),
+        qt_point(bezier_points[:, 3, 3]),
+    )
+    path.cubicTo(
+        qt_point(bezier_points[:, 2, 3]),
+        qt_point(bezier_points[:, 1, 3]),
+        qt_point(bezier_points[:, 0, 3]),
+    )
+    path.cubicTo(
+        qt_point(bezier_points[:, 0, 2]),
+        qt_point(bezier_points[:, 0, 1]),
+        qt_point(bezier_points[:, 0, 0]),
+    )
+    return path
+
+
+class static_mesh_item(QGraphicsPathItem):
+    """Single non-interactive path containing every active mesh element."""
+    def __init__(self):
+        super().__init__()
+        self.setZValue(Z_STATIC_MESH)
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        pen = QPen(QColor(70, 70, 70))
+        pen.setWidthF(STATIC_MESH_WIDTH)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(QBrush(Qt.NoBrush))
+        self.rebuild_path()
+
+    def rebuild_path(self):
+        path = QPainterPath()
+        for element in element_list:
+            if not getattr(element, "active", True):
+                continue
+            path.addPath(element_outline_path(
+                scaled_element_points(element.vertices, element.sizes)
+            ))
+        self.setPath(path)
+
+
+def rebuild_static_mesh_path(expected_scene=None):
+    current_static_mesh = globals().get("static_mesh")
+    if (
+        current_static_mesh is not None
+        and (
+            expected_scene is None
+            or graphics_item_in_scene(current_static_mesh, expected_scene)
+        )
+    ):
+        current_static_mesh.rebuild_path()
 
 
 class jorek_element_item(QGraphicsItem):
@@ -3282,7 +4563,7 @@ class jorek_element_item(QGraphicsItem):
         self.index    = index
         self.vertices = vertices      # [vertex,order]
         self.sizes    = sizes
-        self.points   = jorek.nodes_xx[:,:,vertices] 
+        self.points   = jorek.nodes_xx[:,:,vertices]
         self.edges    = []
 
 #        self.points = np.array([node_list[vertices[0]].xx,
@@ -3325,26 +4606,7 @@ class jorek_element_item(QGraphicsItem):
 
   
     def createPath(self):
-        # Create the patch using the control points
-        path = QPainterPath()
-
-        bezier_points = element_bezier_points(self.points, this_scaling)
-
-        path.moveTo( QPointF(bezier_points[0,0,0].item(),bezier_points[1,0,0].item()))
-        path.cubicTo(QPointF(bezier_points[0,1,0].item(),bezier_points[1,1,0].item()),
-                     QPointF(bezier_points[0,2,0].item(),bezier_points[1,2,0].item()),
-                     QPointF(bezier_points[0,3,0].item(),bezier_points[1,3,0].item()))
-        path.cubicTo(QPointF(bezier_points[0,3,1].item(),bezier_points[1,3,1].item()),
-                     QPointF(bezier_points[0,3,2].item(),bezier_points[1,3,2].item()),
-                     QPointF(bezier_points[0,3,3].item(),bezier_points[1,3,3].item()))
-        path.cubicTo(QPointF(bezier_points[0,2,3].item(),bezier_points[1,2,3].item()),
-                     QPointF(bezier_points[0,1,3].item(),bezier_points[1,1,3].item()),
-                     QPointF(bezier_points[0,0,3].item(),bezier_points[1,0,3].item()))
-        path.cubicTo(QPointF(bezier_points[0,0,2].item(),bezier_points[1,0,2].item()),
-                     QPointF(bezier_points[0,0,1].item(),bezier_points[1,0,1].item()),
-                     QPointF(bezier_points[0,0,0].item(),bezier_points[1,0,0].item()))
-                                         
-        return path    
+        return element_outline_path(self.points)
     
     def boundingRect(self):
         return self.path_item.boundingRect()
@@ -3380,16 +4642,20 @@ class jorek_element_item(QGraphicsItem):
 
 class basis_vector_handle(QGraphicsEllipseItem):
     def __init__(self, node, basis_index, color):
-        super().__init__(-5.0, -5.0, 10.0, 10.0, node)
+        super().__init__(
+            -VECTOR_HANDLE_SIZE / 2.0, -VECTOR_HANDLE_SIZE / 2.0,
+            VECTOR_HANDLE_SIZE, VECTOR_HANDLE_SIZE, node,
+        )
         self.node = node
         self.basis_index = basis_index
         self.setBrush(QBrush(color))
-        self.setPen(QPen(Qt.black, 1.0))
+        self.setPen(graphics_handle_outline_pen())
         self.setZValue(Z_VECTOR_HANDLE)
         self.sync_position()
 
     def sync_position(self):
-        endpoint = self.node.position + qt_point(self.node.xx[:, self.basis_index])
+        effective = node_basis_display_vector(self.node, self.basis_index)
+        endpoint = self.node.position + qt_point(effective)
         self.setPos(endpoint)
 
     def move_to_scene(self, scene_position):
@@ -3404,12 +4670,26 @@ class basis_vector_handle(QGraphicsEllipseItem):
         vector = basis_vector_from_scene(
             node_position, handle_position, this_scaling
         )
+        reference_scale = node_basis_display_scale(
+            self.node, self.basis_index
+        )
+        if np.isclose(reference_scale, 0.0):
+            print(
+                "Cannot move basis handle with zero reference scale:",
+                self.node.index, self.basis_index,
+            )
+            self.sync_position()
+            return
+        raw_vector = vector / reference_scale
 
         self.node.prepareGeometryChange()
-        jorek.nodes_xx[:, self.basis_index, self.node.index] = vector
-        self.node.xx[:, self.basis_index] = this_scaling * vector
+        jorek.nodes_xx[:, self.basis_index, self.node.index] = raw_vector
+        self.node.xx[:, self.basis_index] = this_scaling * raw_vector
         self.setPos(scene_position)
         self.node.update_connected_items(self.basis_index)
+        scene = self.node.scene()
+        if scene is not None and scene.views():
+            scene.views()[0].mark_document_modified()
 
 
 class jorek_node_item(QGraphicsItem):
@@ -3440,6 +4720,8 @@ class jorek_node_item(QGraphicsItem):
         self.position = QPointF(xx[0,0], xx[1,0])
         self.blue_handle = basis_vector_handle(self, 1, QColor(0, 0, 255))
         self.red_handle = basis_vector_handle(self, 2, QColor(255, 0, 0))
+        if DIAGNOSTIC_ELEMENTS_ONLY:
+            self.setVisible(False)
 
     def boundingRect(self):
         zoom_level = 1.0
@@ -3447,10 +4729,14 @@ class jorek_node_item(QGraphicsItem):
             zoom_level = self.scene().views()[0].zoom_level
 
         node_radius = NODE_MARKER_SIZE / (2.0 * zoom_level)
-        handle_radius = 8.0 / zoom_level
+        handle_radius = VECTOR_HANDLE_SIZE / (2.0 * zoom_level)
         pen_margin = 6.0 / zoom_level
-        blue_endpoint = self.position + qt_point(self.xx[:, 1])
-        red_endpoint = self.position + qt_point(self.xx[:, 2])
+        blue_endpoint = self.position + qt_point(
+            node_basis_display_vector(self, 1)
+        )
+        red_endpoint = self.position + qt_point(
+            node_basis_display_vector(self, 2)
+        )
 
         left = min(
             self.position.x() - node_radius,
@@ -3515,6 +4801,9 @@ class jorek_node_item(QGraphicsItem):
         self.blue_handle.sync_position()
         self.red_handle.sync_position()
         self.update_connected_items()
+        scene = self.scene()
+        if scene is not None and scene.views():
+            scene.views()[0].mark_document_modified()
 
     def update_connected_items(self, basis_index=None):
         if self.scene() is not None:
@@ -3546,15 +4835,21 @@ class jorek_node_item(QGraphicsItem):
 
         painter.setPen(QPen(Qt.black, 1. / zoom_level))
 
-        painter.setPen(QPen(Qt.blue, 10. / zoom_level))
-        painter.drawLine(self.position, self.position + qt_point(self.xx[:,1]))
-        painter.setPen(QPen(Qt.red, 10. / zoom_level))
-        painter.drawLine(self.position, self.position + qt_point(self.xx[:,2]))
+        painter.setPen(QPen(Qt.blue, BASIS_VECTOR_WIDTH / zoom_level))
+        painter.drawLine(
+            self.position,
+            self.position + qt_point(node_basis_display_vector(self, 1)),
+        )
+        painter.setPen(QPen(Qt.red, BASIS_VECTOR_WIDTH / zoom_level))
+        painter.drawLine(
+            self.position,
+            self.position + qt_point(node_basis_display_vector(self, 2)),
+        )
 
         self.ellipse_item.setPen(QPen(Qt.black, 1./zoom_level))
         self.ellipse_item.paint(painter,option)
 
-        handle_size = 16. / zoom_level
+        handle_size = VECTOR_HANDLE_SIZE / zoom_level
         handle_rect = QRectF(
             -handle_size / 2., -handle_size / 2., handle_size, handle_size
         )
@@ -3567,57 +4862,290 @@ class jorek_node_item(QGraphicsItem):
    #     painter.drawText(self.position+QPointF(-font_size,font_size/2),str(self.index))
 
 
+SIMPLE_SAVE_COMPACTION_ERROR = (
+    "Saving grids with deleted nodes/elements requires mesh compaction and "
+    "renumbering. This is not implemented yet."
+)
 
-def id_generator(size=6, chars=string.ascii_uppercase + string.digits):   # generates random keys
-  return ''.join(random.choice(chars) for x in range(size))
+
+def live_grid_arrays():
+    """Build validated physical grid arrays from the current editor objects."""
+    nodes = list(globals().get("node_list", []))
+    elements = list(globals().get("element_list", []))
+    if any(not getattr(node, "active", True) for node in nodes):
+        raise ValueError(SIMPLE_SAVE_COMPACTION_ERROR)
+    if any(not getattr(element, "active", True) for element in elements):
+        raise ValueError(SIMPLE_SAVE_COMPACTION_ERROR)
+    if [node.index for node in nodes] != list(range(len(nodes))):
+        raise ValueError(SIMPLE_SAVE_COMPACTION_ERROR)
+    if [element.index for element in elements] != list(range(len(elements))):
+        raise ValueError(SIMPLE_SAVE_COMPACTION_ERROR)
+
+    nodes_xx = np.zeros((2, 4, len(nodes)), dtype=float)
+    boundary = np.empty(len(nodes), dtype=np.int32)
+    for index, node in enumerate(nodes):
+        nodes_xx[:, 0, index] = np_point(node.position) / this_scaling
+        nodes_xx[:, 1:, index] = node.xx[:, 1:] / this_scaling
+        boundary[index] = node.boundary
+
+    if elements:
+        if any(len(element.vertices) != 4 for element in elements):
+            raise ValueError("Every saved grid element must have four vertices")
+        vertices = np.asarray(
+            [element.vertices for element in elements], dtype=np.int64
+        ).T
+        element_sizes = np.stack(
+            [np.asarray(element.sizes) for element in elements], axis=2
+        )
+    else:
+        vertices = np.empty((4, 0), dtype=np.int64)
+        element_sizes = np.empty((4, 4, 0), dtype=float)
+    jorek_grid.validate_grid_arrays(
+        nodes_xx, boundary, vertices, element_sizes
+    )
+    return nodes_xx, boundary, vertices, element_sizes
 
 
-if __name__ == "__main__":
-    app   = QApplication(sys.argv)
-    view  = this_view() 
-    scene = QGraphicsScene()
+def rebuild_graphics_layers():
+    """Recompute the depth-0 editable overlay and static mesh."""
+    global static_mesh
+    if scene is None:
+        return set(), set()
 
-    view.selected_nodes    = None
-    view.selected_elements = None
+    boundary_specs = []
+    for edge in boundary_list:
+        if not getattr(edge, "active", True):
+            continue
+        element_index = edge.element_index
+        element_side = edge.element_side
+        if element_index is None:
+            continue
+        boundary_specs.append((element_index, element_side, edge.vertices))
 
-    jorek = jorek(id_generator())
-#    jorek.read_hdf5('grid_square.h5')
-#    jorek.read_hdf5('jorek_stopped.h5')
-    jorek.read_hdf5('jorek00000.h5')
-#    jorek.read_hdf5('jorek00120.h5')
-#    jorek.read_hdf5('jorek_restart.h5')
+    editable_elements = editable_boundary_element_indices(
+        element_list, boundary_list
+    )
+    editable_nodes = editable_node_indices(element_list, editable_elements)
+    old_boundary_edges = set(boundary_list)
 
-    this_scaling = 100
+    for edge in list(boundary_list):
+        if isinstance(edge, QGraphicsItem) and edge.scene() is scene:
+            deactivate_boundary_edge(edge)
 
-    node_list = []
-    for i in range(jorek.nodes_xx.shape[2]):
-       this_node_item = jorek_node_item(i,this_scaling*jorek.nodes_xx[:,:,i],jorek.boundary[i])
-       node_list.append(this_node_item)
+    for list_index, element in enumerate(list(element_list)):
+        should_be_interactive = (
+            getattr(element, "active", True)
+            and element.index in editable_elements
+        )
+        if should_be_interactive:
+            if not isinstance(element, jorek_element_item):
+                old_element = element
+                element = jorek_element_item(
+                    element.index, element.vertices, element.sizes
+                )
+                element.edges = [
+                    edge for edge in getattr(old_element, "edges", [])
+                    if edge not in old_boundary_edges
+                ]
+                element_list[list_index] = element
+            else:
+                element.edges = [
+                    edge for edge in element.edges
+                    if edge not in old_boundary_edges
+                ]
+            if element.scene() is None:
+                scene.addItem(element)
+        else:
+            if isinstance(element, jorek_element_item):
+                if element.scene() is scene:
+                    scene.removeItem(element)
+                element_list[list_index] = mesh_element_record(
+                    element.index, element.vertices, element.sizes,
+                    active=getattr(element, "active", True),
+                )
 
-    element_list = []
-    for i in range(jorek.vertices.shape[1]):
-      this_element_item = jorek_element_item(i,jorek.vertices[:,i],jorek.elements_size[:,:,i])
-      element_list.append(this_element_item)
+    for node_index, node in enumerate(list(node_list)):
+        if not getattr(node, "active", True):
+            continue
+        should_be_interactive = (
+            node_index in editable_nodes
+        )
+        if should_be_interactive:
+            if not isinstance(node, jorek_node_item):
+                node = jorek_node_item(
+                    node.index,
+                    this_scaling * jorek.nodes_xx[:, :, node.index],
+                    node.boundary,
+                )
+                node_list[node_index] = node
+            if node.scene() is None:
+                scene.addItem(node)
+        else:
+            if isinstance(node, jorek_node_item):
+                if node.scene() is scene:
+                    scene.removeItem(node)
+                node_list[node_index] = mesh_node_record(
+                    node.index,
+                    this_scaling * jorek.nodes_xx[:, :, node.index],
+                    node.boundary,
+                    active=getattr(node, "active", True),
+                )
 
-    boundary_list = []
-    for this_element in element_list:
-        edges = this_element.find_boundary_edges()
-        for this_edge in edges: 
-            boundary_list.append(this_edge)
-            this_element.edges.append(this_edge)
-            scene.addItem(this_edge)
+    elements_by_index = {
+        element.index: element for element in element_list
+    }
+    new_boundary_list = []
+    for element_index, element_side, vertices in boundary_specs:
+        element = elements_by_index.get(element_index)
+        if element is None or not isinstance(element, jorek_element_item):
+            continue
+        if element_side is None:
+            edge_key = frozenset(vertices)
+            element_side = next(
+                side for side in range(4)
+                if element_side_key(element, side) == edge_key
+            )
+        edge = boundary_edge_from_element_side(element, element_side)
+        element.edges.append(edge)
+        new_boundary_list.append(edge)
+        scene.addItem(edge)
+    boundary_list[:] = new_boundary_list
 
     rebuild_node_connections()
+    if not graphics_item_in_scene(static_mesh, scene):
+        static_mesh = static_mesh_item()
+        scene.addItem(static_mesh)
+    else:
+        static_mesh.rebuild_path()
 
-    for this_node in node_list:
-        scene.addItem(this_node)
-    for this_element in element_list:
-        scene.addItem(this_element)
- 
-    # Add the scene to a view
+    active_view = globals().get("view")
+    if active_view is not None:
+        active_view.selected_nodes = []
+        active_view.selected_elements = []
+        active_view.selected_edges = []
+        active_view.selected_point = None
+        active_view.dragged_node = None
+    scene.update()
+    return editable_elements, editable_nodes
+
+
+def build_grid_scene(grid, scaling):
+    """Construct a complete replacement scene from validated grid arrays."""
+    global jorek, scene, node_list, element_list, boundary_list, static_mesh
+    jorek_grid.validate_grid_arrays(
+        grid.nodes_xx, grid.boundary, grid.vertices, grid.elements_size
+    )
+    previous = (
+        globals().get("jorek"), scene, node_list, element_list, boundary_list,
+        static_mesh,
+    )
+    try:
+        jorek = grid
+        scene = QGraphicsScene()
+        scene.setItemIndexMethod(QGraphicsScene.NoIndex)
+        if MEMORY_DIAGNOSTICS:
+            print("[MEM] scene index method: NoIndex", flush=True)
+        node_list = [
+            mesh_node_record(
+                index, scaling * grid.nodes_xx[:, :, index],
+                grid.boundary[index],
+            )
+            for index in range(grid.nodes_xx.shape[2])
+        ]
+        report_memory("after node construction")
+        element_list = [
+            mesh_element_record(
+                index, grid.vertices[:, index],
+                grid.elements_size[:, :, index],
+            )
+            for index in range(grid.vertices.shape[1])
+        ]
+        report_memory("after element construction")
+        boundary_sides = []
+        for element in element_list:
+            for element_side in range(4):
+                vertex0 = element.vertices[element_side]
+                vertex1 = element.vertices[(element_side + 1) % 4]
+                if node_list[vertex0].boundary and node_list[vertex1].boundary:
+                    boundary_sides.append((element.index, element_side))
+
+        editable_elements = {index for index, unused_side in boundary_sides}
+        editable_nodes = editable_node_indices(element_list, editable_elements)
+        for node_index in editable_nodes:
+            record = node_list[node_index]
+            node_list[node_index] = jorek_node_item(
+                record.index, record.xx, record.boundary
+            )
+        for list_index, record in enumerate(element_list):
+            if record.index in editable_elements:
+                element_list[list_index] = jorek_element_item(
+                    record.index, record.vertices, record.sizes
+                )
+
+        elements_by_index = {
+            element.index: element for element in element_list
+        }
+        boundary_list = []
+        for element_index, element_side in boundary_sides:
+            element = elements_by_index[element_index]
+            edge = boundary_edge_from_element_side(element, element_side)
+            boundary_list.append(edge)
+            element.edges.append(edge)
+        report_memory("after boundary discovery")
+        report_boundary_diagnostics()
+        report_graphics_multiplication()
+
+        static_mesh = static_mesh_item()
+        scene.addItem(static_mesh)
+        for edge in boundary_list:
+            scene.addItem(edge)
+        report_memory("after boundary insertion")
+        for node in node_list:
+            if isinstance(node, jorek_node_item):
+                scene.addItem(node)
+        report_memory("after node insertion")
+        for element in element_list:
+            if isinstance(element, jorek_element_item):
+                scene.addItem(element)
+        report_memory("after element insertion")
+        rebuild_node_connections()
+        report_memory("after rebuild connections")
+        return scene, node_list, element_list, boundary_list
+    except Exception:
+        (
+            jorek, scene, node_list, element_list, boundary_list, static_mesh,
+        ) = previous
+        raise
+
+
+def id_generator(size=6, chars=string.ascii_uppercase + string.digits):
+    """Generate a short random key."""
+    return ''.join(random.choice(chars) for x in range(size))
+if __name__ == "__main__":
+    app   = QApplication(sys.argv)
+    if MEMORY_DIAGNOSTICS:
+        reset_memory_diagnostics()
+        report_memory("application started")
+    view  = this_view()
+    scene = QGraphicsScene()
+    scene.setItemIndexMethod(QGraphicsScene.NoIndex)
     view.setScene(scene)
-#    view.scale(1,-1)
-
-    view.show()
-    view.fit_grid_to_window()
+    window = grid_editor_window(view)
+    window.show()
+    if len(sys.argv) > 1:
+        window.open_grid_file(sys.argv[1], interactive=True)
+    else:
+        view.set_patch_status("Use File > Open to load a grid")
+    if MEMORY_DIAGNOSTICS:
+        app.processEvents()
+        report_memory("after first render")
+        print_memory_diagnostic_table()
+        if os.environ.get(
+            "JOREK_GRID_MEMORY_DIAGNOSTIC_EXIT", "0"
+        ) == "1":
+            QTimer.singleShot(0, app.quit)
+    elif DIAGNOSTIC_BASIS_SCALE:
+        app.processEvents()
+    if DIAGNOSTIC_BASIS_SCALE and len(sys.argv) > 1:
+        verify_diagnostic_grid_unchanged(jorek, "after first render")
     sys.exit(app.exec_())

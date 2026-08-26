@@ -25,13 +25,190 @@ class UpdateRecorder:
         self.update_count += 1
 
 
+def install_edge_owner_lookup(monkeypatch, edges):
+    """Give lightweight boundary fixtures the owner metadata production has."""
+    owners = {}
+    for edge in edges:
+        owner = owners.get(edge.element_index)
+        if owner is None:
+            owner = SimpleNamespace(
+                index=edge.element_index,
+                active=True,
+                vertices=np.full(4, -1, dtype=int),
+                sizes=np.ones((4, 4)),
+            )
+            owners[edge.element_index] = owner
+        for endpoint, local_vertex in enumerate(edge.local_nodes_index):
+            owner.vertices[local_vertex] = edge.vertices[endpoint]
+
+    real_element_by_index = grid_editor5.element_by_index
+
+    def element_by_index(index):
+        return owners.get(index) or real_element_by_index(index)
+
+    monkeypatch.setattr(grid_editor5, "element_by_index", element_by_index)
+    return owners
+
+
 def assert_basis_handles_match_vectors(node):
     for basis_index, handle in (
         (1, node.blue_handle),
         (2, node.red_handle),
     ):
-        expected = node.position + grid_editor5.qt_point(node.xx[:, basis_index])
+        expected = node.position + grid_editor5.qt_point(
+            grid_editor5.node_basis_display_vector(node, basis_index)
+        )
         assert handle.pos() == expected
+
+
+def test_element_and_boundary_point_scaling_does_not_modify_grid(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    nodes_xx = np.arange(2 * 4 * 4, dtype=float).reshape(2, 4, 4)
+    vertices = np.array([0, 1, 2, 3])
+    sizes = np.linspace(0.25, 1.75, 16).reshape(4, 4)
+    nodes = [
+        jorek_node_item(index, nodes_xx[:, :, index].copy(), 1)
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx),
+        raising=False,
+    )
+    monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
+    monkeypatch.setattr(grid_editor5, "this_scaling", 1.0, raising=False)
+    before = nodes_xx.copy()
+
+    element = grid_editor5.jorek_element_item(0, vertices, sizes)
+    edges = element.find_boundary_edges()
+
+    assert np.array_equal(nodes_xx, before)
+    assert not np.shares_memory(element.points, nodes_xx)
+    assert edges
+    assert all(not np.shares_memory(edge.points, nodes_xx) for edge in edges)
+    assert app is not None
+
+
+def display_element(index, node_index, scale_u, scale_v):
+    sizes = np.ones((4, 1))
+    sizes[1, 0] = scale_u
+    sizes[2, 0] = scale_v
+    return SimpleNamespace(
+        index=index, vertices=np.array([node_index]), sizes=sizes,
+        active=True, update=lambda: None,
+    )
+
+
+def display_boundary_edge(element_index, node_index, uv_index=1):
+    return SimpleNamespace(
+        element_index=element_index, vertices=[node_index], uv_index=uv_index,
+        active=True, update=lambda: None,
+    )
+
+
+def test_boundary_display_reference_is_owner_preferred_and_deterministic():
+    node = jorek_node_item(0, np.zeros((2, 4)), 1)
+    lower_element = display_element(3, node.index, 0.2, -0.4)
+    boundary_owner = display_element(9, node.index, 0.6, -0.8)
+    node.connected_elements = [boundary_owner, lower_element]
+    node.connected_boundary_edges = [
+        display_boundary_edge(boundary_owner.index, node.index)
+    ]
+
+    reference = grid_editor5.node_display_reference(node)
+    assert reference[0] is boundary_owner and reference[1] == 0
+    assert grid_editor5.node_basis_display_scale(node, 1) == pytest.approx(0.6)
+    assert grid_editor5.node_basis_display_scale(node, 2) == pytest.approx(-0.8)
+
+    node.connected_boundary_edges.append(
+        display_boundary_edge(lower_element.index, node.index)
+    )
+    reference = grid_editor5.node_display_reference(node)
+    assert reference[0] is lower_element and reference[1] == 0
+
+
+def test_display_vectors_and_handles_use_element_local_scales():
+    node_xx = np.zeros((2, 4))
+    node_xx[:, 0] = [10.0, 20.0]
+    node_xx[:, 1] = [6.0, -2.0]
+    node_xx[:, 2] = [-3.0, 5.0]
+    node = jorek_node_item(0, node_xx, 1)
+    element = display_element(4, node.index, 0.25, -0.5)
+    node.connected_elements = [element]
+    node.connected_boundary_edges = [
+        display_boundary_edge(element.index, node.index)
+    ]
+
+    node.blue_handle.sync_position()
+    node.red_handle.sync_position()
+
+    assert np.allclose(
+        grid_editor5.node_basis_display_vector(node, 1), [1.5, -0.5]
+    )
+    assert np.allclose(
+        grid_editor5.node_basis_display_vector(node, 2), [1.5, -2.5]
+    )
+    assert_basis_handles_match_vectors(node)
+
+
+@pytest.mark.parametrize(
+    "basis_index, reference_scale, effective_scene_vector",
+    [(1, 0.25, np.array([20.0, -30.0])),
+     (2, -0.5, np.array([20.0, -30.0]))],
+)
+def test_handle_drag_stores_raw_basis_using_signed_reference_scale(
+    monkeypatch, basis_index, reference_scale, effective_scene_vector
+):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    nodes_xx = np.zeros((2, 4, 1))
+    node_xx = np.zeros((2, 4))
+    node_xx[:, 0] = [100.0, 200.0]
+    node = jorek_node_item(0, node_xx, 1)
+    scene.addItem(node)
+    scale_u = reference_scale if basis_index == 1 else 0.75
+    scale_v = reference_scale if basis_index == 2 else 0.75
+    element = display_element(7, node.index, scale_u, scale_v)
+    node.connected_elements = [element]
+    node.connected_boundary_edges = [
+        display_boundary_edge(element.index, node.index, basis_index)
+    ]
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx),
+        raising=False,
+    )
+    monkeypatch.setattr(grid_editor5, "this_scaling", 10.0, raising=False)
+    handle = node.blue_handle if basis_index == 1 else node.red_handle
+    target = node.position + grid_editor5.qt_point(effective_scene_vector)
+
+    handle.move_to_scene(target)
+
+    effective_physical = effective_scene_vector / 10.0
+    expected_raw = effective_physical / reference_scale
+    assert np.allclose(nodes_xx[:, basis_index, node.index], expected_raw)
+    assert np.allclose(node.xx[:, basis_index], 10.0 * expected_raw)
+    assert np.allclose(reference_scale * expected_raw, effective_physical)
+    assert handle.pos() == target
+    assert app is not None
+
+
+def test_display_reference_reselects_after_owner_becomes_inactive():
+    node = jorek_node_item(0, np.zeros((2, 4)), 1)
+    first = display_element(1, node.index, 0.2, 0.3)
+    second = display_element(2, node.index, 0.4, 0.5)
+    node.connected_elements = [second, first]
+    node.connected_boundary_edges = [
+        display_boundary_edge(first.index, node.index),
+        display_boundary_edge(second.index, node.index),
+    ]
+
+    reference = grid_editor5.node_display_reference(node)
+    assert reference[0] is first and reference[1] == 0
+    first.active = False
+    reference = grid_editor5.node_display_reference(node)
+    assert reference[0] is second and reference[1] == 0
+    assert grid_editor5.node_basis_display_scale(node, 1) == pytest.approx(0.4)
 
 
 def test_bezier_nodal_parameter_scales_use_adjacent_interval_means():
@@ -436,6 +613,14 @@ def test_node_shape_only_contains_visible_marker_at_any_zoom(zoom_level):
     assert node not in scene.items(blue_vector_middle)
     assert node.blue_handle in scene.items(node.blue_handle.scenePos())
     assert node.red_handle in scene.items(node.red_handle.scenePos())
+    assert node.blue_handle.pen().isCosmetic()
+    assert node.red_handle.pen().isCosmetic()
+    assert node.blue_handle.pen().widthF() == pytest.approx(
+        grid_editor5.GRAPHICS_HANDLE_OUTLINE_WIDTH
+    )
+    assert node.red_handle.pen().widthF() == pytest.approx(
+        grid_editor5.GRAPHICS_HANDLE_OUTLINE_WIDTH
+    )
     assert node.boundingRect().contains(node.blue_handle.pos())
     assert node.boundingRect().contains(node.red_handle.pos())
     assert app is not None
@@ -561,6 +746,7 @@ def configure_element_creation(monkeypatch, positions, edge_specs):
         )
         old_edges.append(edge)
         scene.addItem(edge)
+    install_edge_owner_lookup(monkeypatch, old_edges)
 
     monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
     monkeypatch.setattr(grid_editor5, "element_list", [], raising=False)
@@ -988,7 +1174,10 @@ def test_escape_clears_all_selections_and_current_patch():
 
     assert view.selected_edges == []
     assert edge.pen().color() == Qt.yellow
-    assert edge.pen().widthF() == 3.0
+    assert edge.pen().widthF() == pytest.approx(
+        grid_editor5.BOUNDARY_EDGE_WIDTH
+    )
+    assert edge.pen().isCosmetic()
     assert view.current_patch is None
     assert view.pending_main_uv_index is None
     assert patch.scene() is None
@@ -1523,6 +1712,84 @@ def test_dragging_bezier_handles_updates_outer_preview():
     assert app is not None
 
 
+def test_extended_bezier_handles_use_fixed_screen_size_and_cosmetic_outline():
+    app = QApplication.instance() or QApplication([])
+    inner_nodes = [
+        SimpleNamespace(index=index, position=QPointF(float(index), 0.0))
+        for index in range(3)
+    ]
+    patch = grid_editor5.extended_patch(inner_nodes, [object(), object()])
+    patch.set_outer_positions([
+        QPointF(0.0, 2.0), QPointF(1.0, 2.0), QPointF(2.0, 2.0)
+    ])
+    patch.enable_bezier_mode()
+
+    assert patch.bezier_handles
+    for handle in patch.bezier_handles:
+        assert handle.flags() & grid_editor5.QGraphicsItem.ItemIgnoresTransformations
+        assert handle.rect().width() == pytest.approx(
+            grid_editor5.EXTENDED_BEZIER_HANDLE_SIZE
+        )
+        assert handle.rect().height() == pytest.approx(
+            grid_editor5.EXTENDED_BEZIER_HANDLE_SIZE
+        )
+        assert handle.pen().isCosmetic()
+        assert handle.pen().widthF() == pytest.approx(
+            grid_editor5.GRAPHICS_HANDLE_OUTLINE_WIDTH
+        )
+    assert app is not None
+
+
+@pytest.mark.parametrize("zoom_level", [0.1, 1.0, 10.0])
+def test_extended_patch_preview_graphics_use_screen_sized_dimensions(zoom_level):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    view.zoom_level = zoom_level
+    inner_nodes = [
+        SimpleNamespace(index=index, position=QPointF(float(index), 0.0))
+        for index in range(3)
+    ]
+    patch = grid_editor5.extended_patch(inner_nodes, [object(), object()])
+    patch.set_outer_positions([
+        QPointF(0.0, 2.0), QPointF(1.0, 2.0), QPointF(2.0, 2.0)
+    ])
+    patch.set_radial_layers(2)
+    scene.addItem(patch)
+
+    class RecordingPainter:
+        def __init__(self):
+            self.pen = None
+            self.ellipses = []
+
+        def setPen(self, pen):
+            self.pen = pen
+
+        def drawPath(self, unused_path):
+            pass
+
+        def drawEllipse(self, x, y, width, height):
+            self.ellipses.append((x, y, width, height))
+
+    painter = RecordingPainter()
+    patch.paint(painter, None)
+
+    assert patch.pen().isCosmetic()
+    assert patch.pen().widthF() == pytest.approx(
+        grid_editor5.EXTENDED_PATCH_LINE_WIDTH
+    )
+    assert painter.ellipses
+    for unused_x, unused_y, width, height in painter.ellipses:
+        assert width * zoom_level == pytest.approx(
+            grid_editor5.EXTENDED_PATCH_NODE_SIZE
+        )
+        assert height * zoom_level == pytest.approx(
+            grid_editor5.EXTENDED_PATCH_NODE_SIZE
+        )
+    assert app is not None
+
+
 def test_initial_bezier_midpoint_is_outside_owning_element(monkeypatch):
     app = QApplication.instance() or QApplication([])
     positions = [
@@ -1565,6 +1832,132 @@ def test_initial_bezier_midpoint_is_outside_owning_element(monkeypatch):
         element_centroid - boundary_midpoint,
     ) < 0
     assert np.allclose(curve_midpoint, [1.0, -1.0])
+    assert app is not None
+
+
+def test_imported_transverse_scale_is_inherited_at_old_boundary(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    positions = [
+        (0.0, 0.0), (1.0, 0.0),
+        (1.0, -0.3), (0.0, -0.3),
+    ]
+    nodes_xx = np.zeros((2, 4, len(positions)))
+    for index, position in enumerate(positions):
+        nodes_xx[:, 0, index] = position
+        nodes_xx[:, 1, index] = [1.0 / 3.0, 0.0]
+        nodes_xx[:, 2, index] = [0.0, 100.0]
+    nodes = [
+        jorek_node_item(index, nodes_xx[:, :, index], 2)
+        for index in range(len(positions))
+    ]
+    for node in nodes:
+        scene.addItem(node)
+
+    old_sizes = np.ones((4, 4))
+    old_sizes[1, :] = [1.0, -1.0, 1.0, -1.0]
+    old_sizes[2, :] = -0.001
+    old_sizes[3, :] = old_sizes[1, :] * old_sizes[2, :]
+    old_element = grid_editor5.mesh_element_record(
+        10, [0, 1, 2, 3], old_sizes
+    )
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx)
+    )
+    monkeypatch.setattr(grid_editor5, "this_scaling", 1.0, raising=False)
+    inner_edge_sizes = np.ones((2, 2))
+    inner_edge_sizes[1, :] = old_sizes[1, :2]
+    inner_edge = grid_editor5.boundary_edge(
+        [nodes[0], nodes[1]], [0, 1], [0, 1],
+        old_element.index, 0, 1, inner_edge_sizes,
+    )
+    scene.addItem(inner_edge)
+
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx)
+    )
+    monkeypatch.setattr(grid_editor5, "this_scaling", 1.0, raising=False)
+    monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
+    monkeypatch.setattr(
+        grid_editor5, "element_list", [old_element], raising=False
+    )
+    monkeypatch.setattr(
+        grid_editor5, "boundary_list", [inner_edge], raising=False
+    )
+    monkeypatch.setattr(grid_editor5, "scene", scene, raising=False)
+    monkeypatch.setattr(grid_editor5, "view", view, raising=False)
+    monkeypatch.setattr(grid_editor5, "static_mesh", None, raising=False)
+
+    old_vertices_snapshot = np.array(old_element.vertices, copy=True)
+    old_sizes_snapshot = np.array(old_element.sizes, copy=True)
+    old_raw_snapshot = np.array(nodes_xx, copy=True)
+    old_node_count = nodes_xx.shape[2]
+    old_controls_snapshot = element_bezier_points(
+        grid_editor5.scaled_element_points(
+            old_element.vertices, old_element.sizes
+        ),
+        1.0,
+    )
+
+    patch = grid_editor5.extended_patch(nodes[:2], [inner_edge])
+    patch.set_outer_positions([QPointF(0.0, 0.3), QPointF(1.0, 0.3)])
+    patch.enable_bezier_mode()
+    scene.addItem(patch)
+    view.current_extended_patch = patch
+    view.selected_edges = [inner_edge]
+
+    node_rows, created_elements = (
+        grid_editor5.add_extended_patch_to_nodes_elements(patch)
+    )
+
+    assert len(created_elements) == 1
+    new_element = created_elements[0]
+    radial_uv = 2
+    outer_by_inner = dict(zip(nodes[:2], node_rows[1]))
+    for old_node in nodes[:2]:
+        old_local = list(old_element.vertices).index(old_node.index)
+        new_local = list(new_element.vertices).index(old_node.index)
+        outer_node = outer_by_inner[old_node]
+        radial_chord = (
+            grid_editor5.np_point(outer_node.position)
+            - grid_editor5.np_point(old_node.position)
+        )
+        new_size = new_element.sizes[radial_uv, new_local]
+        effective = new_size * old_node.xx[:, radial_uv]
+        assert abs(new_size) == pytest.approx(
+            abs(old_element.sizes[radial_uv, old_local])
+        )
+        assert abs(new_size) != pytest.approx(1.0)
+        assert np.inner(effective, radial_chord) > 0.0
+        assert np.linalg.norm(effective) / np.linalg.norm(
+            radial_chord
+        ) == pytest.approx(1.0 / 3.0)
+        assert new_element.sizes[3, new_local] == pytest.approx(
+            new_element.sizes[1, new_local]
+            * new_element.sizes[2, new_local]
+        )
+
+        outer_local = list(new_element.vertices).index(outer_node.index)
+        assert abs(new_element.sizes[radial_uv, outer_local]) == pytest.approx(
+            1.0
+        )
+
+    assert np.array_equal(old_element.vertices, old_vertices_snapshot)
+    assert np.array_equal(old_element.sizes, old_sizes_snapshot)
+    assert np.array_equal(
+        grid_editor5.jorek.nodes_xx[:, :, :old_node_count], old_raw_snapshot
+    )
+    assert np.array_equal(
+        element_bezier_points(
+            grid_editor5.scaled_element_points(
+                old_element.vertices, old_element.sizes
+            ),
+            1.0,
+        ),
+        old_controls_snapshot,
+    )
     assert app is not None
 
 
@@ -1627,6 +2020,7 @@ def test_extended_patch_creates_radial_rows(
     patch.set_radial_layers(radial_layers)
     if bezier_mode:
         patch.enable_bezier_mode()
+    install_edge_owner_lookup(monkeypatch, inner_edges)
     preview_final_positions = [
         QPointF(node.position) for node in patch.preview_node_rows[-1]
     ]
@@ -1930,6 +2324,7 @@ def test_capped_two_element_gap_reuses_sequential_single_element_helpers(
     start_side = edge(0, 3, 2, 12)
     end_side = edge(2, 4, 2, 13)
     selected_edges = [end_side, inner_edges[1], start_side, inner_edges[0]]
+    install_edge_owner_lookup(monkeypatch, selected_edges)
     monkeypatch.setattr(
         grid_editor5, "boundary_list", list(selected_edges), raising=False
     )
@@ -2071,6 +2466,7 @@ def build_two_cap_selection(
     selected_edges = list(reversed(
         main_edges + start_cap_edges + end_cap_edges
     ))
+    install_edge_owner_lookup(monkeypatch, selected_edges)
     monkeypatch.setattr(
         grid_editor5, "boundary_list", list(selected_edges), raising=False
     )
@@ -2095,6 +2491,212 @@ def create_two_cap_patch(case):
         type("KeyEvent", (), {"key": lambda self: Qt.Key_E})()
     )
     return case.view.current_extended_patch
+
+
+def test_view_remains_usable_without_extended_patch_controls():
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+
+    assert view.patch_controls is None
+    assert view.pending_main_uv_index is None
+    assert view.pending_radial_layers == 1
+    view.set_pending_main_uv_index(2)
+    view.set_extended_radial_layers(4)
+    assert view.pending_main_uv_index == 2
+    assert view.pending_radial_layers == 4
+    assert app is not None
+
+
+def test_extended_patch_panel_maps_direction_and_keyboard_state():
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    controls = grid_editor5.extended_patch_controls(view)
+
+    controls.main_direction_combo.setCurrentIndex(1)
+    assert view.pending_main_uv_index == 1
+    controls.main_direction_combo.setCurrentIndex(2)
+    assert view.pending_main_uv_index == 2
+    controls.main_direction_combo.setCurrentIndex(0)
+    assert view.pending_main_uv_index is None
+
+    view.keyPressEvent(type("KeyEvent", (), {"key": lambda self: Qt.Key_1})())
+    assert view.pending_main_uv_index == 1
+    assert controls.main_direction_combo.currentData() == 1
+    view.keyPressEvent(type("KeyEvent", (), {"key": lambda self: Qt.Key_2})())
+    assert view.pending_main_uv_index == 2
+    assert controls.main_direction_combo.currentData() == 2
+    assert app is not None
+
+
+def test_extended_patch_panel_updates_uncapped_and_capped_radial_layers():
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    controls = grid_editor5.extended_patch_controls(view)
+
+    class FakePatch:
+        def __init__(self, topology=None, radial_layers=1):
+            self.ordered_edges = [SimpleNamespace(uv_index=1)] * 3
+            self.one_cap_topology = topology
+            self.capped_gap = None
+            self.radial_layers = radial_layers
+            self.bezier_mode = False
+
+        def main_uv_index(self):
+            return 1
+
+        def set_radial_layers(self, value):
+            self.radial_layers = value
+
+    view.current_extended_patch = FakePatch()
+    controls.update_from_view()
+    assert controls.radial_layers_spin.isEnabled()
+    controls.radial_layers_spin.setValue(4)
+    assert view.current_extended_patch.radial_layers == 4
+    view.keyPressEvent(type("KeyEvent", (), {"key": lambda self: Qt.Key_6})())
+    assert view.current_extended_patch.radial_layers == 6
+    assert controls.radial_layers_spin.value() == 6
+
+    cap_topology = SimpleNamespace(
+        start_cap_edges=[object(), object(), object()], end_cap_edges=[]
+    )
+    view.current_extended_patch = FakePatch(cap_topology, radial_layers=3)
+    controls.update_from_view()
+    assert controls.radial_layers_spin.value() == 3
+    assert not controls.radial_layers_spin.isEnabled()
+    assert "fixed by cap chain" in controls.radial_note_label.text()
+    assert app is not None
+
+
+def test_extended_patch_panel_buttons_route_to_view_methods(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    controls = grid_editor5.extended_patch_controls(view)
+    calls = []
+    monkeypatch.setattr(
+        view, "create_extended_patch_preview",
+        lambda: calls.append("preview"),
+    )
+    monkeypatch.setattr(
+        view, "enable_current_patch_bezier",
+        lambda: calls.append("bezier"),
+    )
+    monkeypatch.setattr(
+        view, "commit_current_patch", lambda: calls.append("commit"),
+    )
+    monkeypatch.setattr(
+        view, "cancel_current_operation", lambda: calls.append("cancel"),
+    )
+    for button in (
+        controls.preview_button, controls.bezier_button,
+        controls.commit_button, controls.cancel_button,
+    ):
+        button.setEnabled(True)
+        button.click()
+
+    assert calls == ["preview", "bezier", "commit", "cancel"]
+    assert app is not None
+
+
+def test_grid_editor_window_wraps_independently_constructed_view():
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    window = grid_editor5.grid_editor_window(view)
+
+    assert window.view is view
+    assert window.patch_controls.view is view
+    assert view.patch_controls is window.patch_controls
+    assert window.centralWidget() is not None
+    assert window.patch_controls.width() == 250
+    window.close()
+    assert app is not None
+
+
+def test_keyboard_bezier_action_refreshes_attached_panel(monkeypatch):
+    case = build_two_cap_selection(monkeypatch, 1, main_edge_count=2)
+    controls = grid_editor5.extended_patch_controls(case.view)
+    controls.main_direction_combo.setCurrentIndex(1)
+    controls.preview_button.click()
+
+    assert case.view.current_extended_patch is not None
+    assert not case.view.current_extended_patch.bezier_mode
+    case.view.keyPressEvent(
+        type("KeyEvent", (), {"key": lambda self: Qt.Key_B})()
+    )
+
+    assert case.view.current_extended_patch.bezier_mode
+    assert controls.outer_boundary_combo.currentData() is True
+    assert not controls.outer_boundary_combo.isEnabled()
+    assert not controls.bezier_button.isEnabled()
+    assert controls.status_message == "Bézier enabled"
+    assert case.app is not None
+
+
+def test_extended_patch_panel_two_cap_preview_and_cancel(monkeypatch):
+    case = build_two_cap_selection(monkeypatch, 2, main_edge_count=3)
+    controls = grid_editor5.extended_patch_controls(case.view)
+
+    assert "7 boundary edges" in controls.selection_label.text()
+    controls.main_direction_combo.setCurrentIndex(1)
+    controls.outer_boundary_combo.setCurrentIndex(1)
+    controls.preview_button.click()
+
+    patch = case.view.current_extended_patch
+    assert patch is not None
+    assert patch.bezier_mode
+    assert not controls.main_direction_combo.isEnabled()
+    assert controls.main_direction_combo.currentData() == 1
+    assert controls.radial_layers_spin.value() == 2
+    assert not controls.radial_layers_spin.isEnabled()
+    assert not controls.bezier_button.isEnabled()
+    assert controls.commit_button.isEnabled()
+    assert controls.status_message == "Bézier enabled"
+
+    controls.cancel_button.click()
+    assert case.view.current_extended_patch is None
+    assert case.view.selected_edges == []
+    assert controls.main_direction_combo.isEnabled()
+    assert controls.main_direction_combo.currentData() is None
+    assert controls.outer_boundary_combo.currentData() is False
+    assert controls.status_message == "Ready"
+    assert case.app is not None
+
+
+def test_extended_patch_panel_commit_matches_keyboard_commit(monkeypatch):
+    gui_case = build_two_cap_selection(monkeypatch, 1, main_edge_count=1)
+    gui_initial_node_count = len(grid_editor5.node_list)
+    gui_controls = grid_editor5.extended_patch_controls(gui_case.view)
+    gui_controls.main_direction_combo.setCurrentIndex(1)
+    gui_controls.preview_button.click()
+    gui_controls.commit_button.click()
+
+    assert gui_case.view.current_extended_patch is None
+    assert gui_controls.status_message == "Patch committed"
+    assert not gui_controls.commit_button.isEnabled()
+    gui_result = (
+        len(grid_editor5.node_list) - gui_initial_node_count,
+        len(grid_editor5.element_list), len(grid_editor5.boundary_list),
+    )
+
+    keyboard_case = build_two_cap_selection(
+        monkeypatch, 1, main_edge_count=1
+    )
+    keyboard_initial_node_count = len(grid_editor5.node_list)
+    keyboard_case.view.keyPressEvent(
+        type("KeyEvent", (), {"key": lambda self: Qt.Key_1})()
+    )
+    keyboard_case.view.keyPressEvent(
+        type("KeyEvent", (), {"key": lambda self: Qt.Key_E})()
+    )
+    keyboard_case.view.keyPressEvent(
+        type("KeyEvent", (), {"key": lambda self: Qt.Key_P})()
+    )
+    keyboard_result = (
+        len(grid_editor5.node_list) - keyboard_initial_node_count,
+        len(grid_editor5.element_list), len(grid_editor5.boundary_list),
+    )
+    assert keyboard_case.view.current_extended_patch is None
+    assert keyboard_result == gui_result
+    assert gui_case.app is not None
 
 
 def test_two_cap_preview_reuses_multi_edge_cap_nodes(monkeypatch):
@@ -2306,8 +2908,7 @@ def test_multi_layer_two_cap_bezier_commit_preserves_final_curve(
     cap_snapshots = [
         (
             node, grid_editor5.np_point(node.position),
-            np.array(node.xx, copy=True), QPointF(node.blue_handle.pos()),
-            QPointF(node.red_handle.pos()),
+            np.array(node.xx, copy=True),
         )
         for node in case.start_nodes + case.end_nodes
     ]
@@ -2337,11 +2938,9 @@ def test_multi_layer_two_cap_bezier_commit_preserves_final_curve(
     for radial_index, row in enumerate(node_rows):
         assert row[0] is case.start_nodes[radial_index]
         assert row[-1] is case.end_nodes[radial_index]
-    for node, position, xx, blue_position, red_position in cap_snapshots:
+    for node, position, xx in cap_snapshots:
         assert np.array_equal(grid_editor5.np_point(node.position), position)
         assert np.array_equal(node.xx, xx)
-        assert node.blue_handle.pos() == blue_position
-        assert node.red_handle.pos() == red_position
         assert_basis_handles_match_vectors(node)
     assert all(
         np.allclose(grid_editor5.np_point(node.position), preview_position)
@@ -2485,6 +3084,7 @@ def test_one_cap_gap_creation_normalizes_cap_first_orientation(
     inner1 = edge(1, 2, 1, 11)
     cap = edge(0, 3, 2, 12) if cap_at_start else edge(2, 3, 2, 12)
     selected_edges = [inner1, cap, inner0]
+    install_edge_owner_lookup(monkeypatch, selected_edges)
     monkeypatch.setattr(
         grid_editor5, "boundary_list", list(selected_edges), raising=False
     )
@@ -2596,6 +3196,7 @@ def build_multi_layer_one_cap_case(
         ))
         previous = cap_node_index
     selected_edges = list(reversed(main_edges + cap_edges))
+    install_edge_owner_lookup(monkeypatch, selected_edges)
     monkeypatch.setattr(
         grid_editor5, "boundary_list", list(selected_edges), raising=False
     )
@@ -2633,13 +3234,15 @@ def test_graphics_items_use_explicit_visual_layering(monkeypatch):
     single_patch_preview = big_patch()
 
     assert (
-        grid_editor5.Z_MESH_EDGE
+        grid_editor5.Z_STATIC_MESH
+        < grid_editor5.Z_MESH_EDGE
+        < grid_editor5.Z_BOUNDARY_EDGE
         < grid_editor5.Z_PATCH_PREVIEW
         < grid_editor5.Z_NODE
         < grid_editor5.Z_VECTOR_HANDLE
     )
     assert all(
-        edge.zValue() == grid_editor5.Z_MESH_EDGE
+        edge.zValue() == grid_editor5.Z_BOUNDARY_EDGE
         for edge in case.main_edges + case.cap_edges
     )
     assert case.patch.zValue() == grid_editor5.Z_PATCH_PREVIEW
@@ -2812,8 +3415,6 @@ def test_multi_layer_one_cap_bezier_commit_preserves_final_curve(
     fixed_node = case.cap_nodes[-1]
     fixed_position = grid_editor5.np_point(fixed_node.position)
     fixed_xx = np.array(fixed_node.xx, copy=True)
-    fixed_blue_position = QPointF(fixed_node.blue_handle.pos())
-    fixed_red_position = QPointF(fixed_node.red_handle.pos())
     original_node_count = len(grid_editor5.node_list)
 
     commit_result = {}
@@ -2840,8 +3441,7 @@ def test_multi_layer_one_cap_bezier_commit_preserves_final_curve(
     assert node_rows[-1][0] is fixed_node
     assert np.array_equal(grid_editor5.np_point(fixed_node.position), fixed_position)
     assert np.array_equal(fixed_node.xx, fixed_xx)
-    assert fixed_node.blue_handle.pos() == fixed_blue_position
-    assert fixed_node.red_handle.pos() == fixed_red_position
+    assert_basis_handles_match_vectors(fixed_node)
     assert [
         node for node in grid_editor5.node_list
         if np.allclose(grid_editor5.np_point(node.position), fixed_position)

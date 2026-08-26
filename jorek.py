@@ -102,6 +102,76 @@ class jorek:
     t_cpu  = time.process_time() -t_cpu
     print('h5py timing : ',t_wall,t_cpu)
 
+  def read_grid_hdf5(self, file_name):
+    """Read only the geometry datasets required by the grid editor."""
+    required = {"x", "boundary", "vertex", "size"}
+    with h5py.File(file_name, "r") as hdf5:
+      missing = required.difference(hdf5.keys())
+      if missing:
+        raise ValueError(
+          "Grid file is missing required datasets: "
+          + ", ".join(sorted(missing))
+        )
+      x = hdf5["x"][:]
+      if x.ndim == 3:
+        self.nodes_xx = x
+      elif x.ndim == 4:
+        self.nodes_xx = x[:, :, 0, :]
+      else:
+        raise ValueError("Grid dataset x must have three or four dimensions")
+      self.boundary = hdf5["boundary"][:]
+      self.vertices = hdf5["vertex"][:] - 1
+      self.elements_size = hdf5["size"][:]
+      self.grid_dataset_names = set(hdf5.keys())
+      self.grid_only_source = self.grid_dataset_names == required
+    self.text = os.path.basename(file_name)
+    self.validate_grid_arrays(
+      self.nodes_xx, self.boundary, self.vertices, self.elements_size
+    )
+    return self
+
+  @staticmethod
+  def validate_grid_arrays(nodes_xx, boundary, vertices, element_sizes):
+    nodes_xx = np.asarray(nodes_xx)
+    boundary = np.asarray(boundary)
+    vertices = np.asarray(vertices)
+    element_sizes = np.asarray(element_sizes)
+    if nodes_xx.ndim != 3 or nodes_xx.shape[:2] != (2, 4):
+      raise ValueError("Grid x must have shape (2, 4, n_nodes)")
+    node_count = nodes_xx.shape[2]
+    if boundary.ndim != 1 or len(boundary) != node_count:
+      raise ValueError("Grid boundary must contain one value per node")
+    if vertices.ndim != 2 or vertices.shape[0] != 4:
+      raise ValueError("Grid vertex must have shape (4, n_elements)")
+    element_count = vertices.shape[1]
+    if element_sizes.shape != (4, 4, element_count):
+      raise ValueError("Grid size must have shape (4, 4, n_elements)")
+    if vertices.size and (
+      np.min(vertices) < 0 or np.max(vertices) >= node_count
+    ):
+      raise ValueError("Grid vertex contains an out-of-range node index")
+
+  def write_grid_hdf5(
+    self, file_name, nodes_xx=None, boundary=None, vertices=None,
+    element_sizes=None,
+  ):
+    """Write a geometry-only editor grid; no simulation datasets are added."""
+    nodes_xx = self.nodes_xx if nodes_xx is None else np.asarray(nodes_xx)
+    boundary = self.boundary if boundary is None else np.asarray(boundary)
+    vertices = self.vertices if vertices is None else np.asarray(vertices)
+    element_sizes = (
+      self.elements_size
+      if element_sizes is None else np.asarray(element_sizes)
+    )
+    self.validate_grid_arrays(
+      nodes_xx, boundary, vertices, element_sizes
+    )
+    with h5py.File(file_name, "w") as hdf5:
+      hdf5.create_dataset("x", data=nodes_xx)
+      hdf5.create_dataset("boundary", data=boundary)
+      hdf5.create_dataset("vertex", data=vertices + 1)
+      hdf5.create_dataset("size", data=element_sizes)
+
   def print_keys(self):
     for key in self.hdf5.keys():
       print(key)
