@@ -878,6 +878,239 @@ def test_extended_patch_number_key_rebuilds_radial_preview_rows(
     assert np.array_equal(np.array(patch.outer_tangents), bezier_tangents)
 
 
+def regular_automatic_extended_patch(monkeypatch):
+    positions = [
+        (0.0, 1.0), (1.0, 1.0), (2.0, 1.0),
+        (0.0, 0.0), (1.0, 0.0), (2.0, 0.0),
+    ]
+    nodes = [
+        SimpleNamespace(index=index, position=QPointF(*position))
+        for index, position in enumerate(positions)
+    ]
+    edges = [
+        SimpleNamespace(
+            nodes=[nodes[0], nodes[1]], vertices=[0, 1],
+            uv_index=1, element_index=10,
+        ),
+        SimpleNamespace(
+            nodes=[nodes[1], nodes[2]], vertices=[1, 2],
+            uv_index=1, element_index=11,
+        ),
+    ]
+    elements = [
+        SimpleNamespace(index=10, vertices=[3, 4, 1, 0]),
+        SimpleNamespace(index=11, vertices=[4, 5, 2, 1]),
+    ]
+    monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
+    monkeypatch.setattr(grid_editor5, "element_list", elements, raising=False)
+    return grid_editor5.extended_patch(nodes[:3], edges)
+
+
+@pytest.mark.parametrize("radial_layers", [1, 2, 3, 4])
+def test_automatic_zero_cap_extent_is_one_base_width_per_layer(
+    monkeypatch, radial_layers
+):
+    patch = regular_automatic_extended_patch(monkeypatch)
+    patch.set_radial_layers(radial_layers)
+    patch.initialize_automatic_outer_geometry()
+
+    assert np.allclose(patch.base_radial_displacement, [0.0, 1.0])
+    for inner_node, outer_node in zip(patch.ordered_nodes, patch.outer_nodes):
+        assert np.allclose(
+            grid_editor5.np_point(outer_node.position)
+            - grid_editor5.np_point(inner_node.position),
+            [0.0, float(radial_layers)],
+        )
+    for column in range(len(patch.ordered_nodes)):
+        row_y = [row[column].position.y() for row in patch.preview_node_rows]
+        assert np.diff(row_y) == pytest.approx(np.ones(radial_layers))
+
+
+def test_automatic_zero_cap_layer_changes_recompute_from_base_width(monkeypatch):
+    patch = regular_automatic_extended_patch(monkeypatch)
+    patch.initialize_automatic_outer_geometry()
+
+    patch.set_radial_layers(3)
+    assert patch.outer_nodes[0].position.y() == pytest.approx(4.0)
+    patch.set_radial_layers(2)
+    assert patch.outer_nodes[0].position.y() == pytest.approx(3.0)
+    patch.set_radial_layers(4)
+    assert patch.outer_nodes[0].position.y() == pytest.approx(5.0)
+    assert np.allclose(patch.base_radial_displacement, [0.0, 1.0])
+
+
+def test_automatic_zero_cap_bezier_preserves_scaled_extent(monkeypatch):
+    patch = regular_automatic_extended_patch(monkeypatch)
+    patch.set_radial_layers(3)
+    patch.initialize_automatic_outer_geometry()
+    straight_endpoints = (
+        QPointF(patch.outer_nodes[0].position),
+        QPointF(patch.outer_nodes[-1].position),
+    )
+
+    patch.enable_bezier_mode()
+
+    assert patch.outer_nodes[0].position == straight_endpoints[0]
+    assert patch.outer_nodes[-1].position == straight_endpoints[1]
+
+
+@pytest.mark.parametrize("radial_layers", [1, 2, 3])
+def test_automatic_one_cap_scales_only_the_free_endpoint(
+    monkeypatch, radial_layers
+):
+    patch = regular_automatic_extended_patch(monkeypatch)
+    cap_nodes = [
+        SimpleNamespace(
+            index=20 + index,
+            position=QPointF(0.0, 1.0 + index),
+            xx=np.array([[0.0, 1.0 / 3.0, 0.0, 0.0],
+                         [0.0, 0.0, 1.0 / 3.0, 0.0]]),
+        )
+        for index in range(radial_layers + 1)
+    ]
+    fixed_outer_node = cap_nodes[-1]
+    patch.one_cap_topology = SimpleNamespace(
+        outer_start_node=fixed_outer_node,
+        outer_end_node=None,
+        start_cap_nodes=cap_nodes,
+        end_cap_nodes=[],
+        start_cap_edges=[object()] * radial_layers,
+        end_cap_edges=[],
+    )
+    patch.radial_layers = radial_layers
+    patch.initialize_automatic_outer_geometry()
+
+    assert patch.outer_nodes[0] is fixed_outer_node
+    assert patch.outer_nodes[-1].position == QPointF(
+        2.0, 1.0 + radial_layers
+    )
+    assert patch.outer_nodes[1].position == QPointF(
+        1.0, 1.0 + radial_layers
+    )
+    straight_free_position = QPointF(patch.outer_nodes[-1].position)
+
+    patch.enable_bezier_mode()
+
+    assert patch.outer_nodes[0] is fixed_outer_node
+    assert patch.outer_nodes[-1].position == straight_free_position
+
+
+def test_automatic_one_cap_regeneration_never_moves_fixed_endpoint(monkeypatch):
+    patch = regular_automatic_extended_patch(monkeypatch)
+    cap_nodes = [
+        SimpleNamespace(
+            index=20 + index,
+            position=QPointF(0.0, 1.0 + index),
+            xx=np.array([[0.0, 1.0 / 3.0, 0.0, 0.0],
+                         [0.0, 0.0, 1.0 / 3.0, 0.0]]),
+        )
+        for index in range(4)
+    ]
+    fixed_outer_node = cap_nodes[-1]
+    patch.one_cap_topology = SimpleNamespace(
+        outer_start_node=fixed_outer_node,
+        outer_end_node=None,
+        start_cap_nodes=cap_nodes,
+        end_cap_nodes=[],
+        start_cap_edges=[object()] * 3,
+        end_cap_edges=[],
+    )
+    patch.radial_layers = 3
+    patch.initialize_automatic_outer_geometry()
+
+    patch.radial_layers = 2
+    regenerated_start, regenerated_end = patch.automatic_outer_endpoints()
+
+    assert regenerated_start == fixed_outer_node.position
+    assert fixed_outer_node.position == QPointF(0.0, 4.0)
+    assert regenerated_end == QPointF(2.0, 3.0)
+
+
+def test_two_cap_automatic_initialization_leaves_outer_geometry_unchanged(
+    monkeypatch
+):
+    patch = regular_automatic_extended_patch(monkeypatch)
+    start_node = SimpleNamespace(index=20, position=QPointF(0.0, 3.0))
+    end_node = SimpleNamespace(index=21, position=QPointF(2.0, 4.0))
+    patch.capped_gap = SimpleNamespace(
+        outer_start_node=start_node,
+        outer_end_node=end_node,
+        start_cap_nodes=[], end_cap_nodes=[],
+        start_cap_edges=[object(), object()],
+        end_cap_edges=[object(), object()],
+    )
+    patch.radial_layers = 2
+    patch.set_outer_positions([
+        start_node.position, QPointF(1.0, 3.5), end_node.position
+    ])
+    before = [QPointF(node.position) for node in patch.outer_nodes]
+
+    patch.initialize_automatic_outer_geometry()
+
+    assert [node.position for node in patch.outer_nodes] == before
+
+
+def test_bezier_preview_along_vectors_interpolate_inner_to_outer():
+    app = QApplication.instance() or QApplication([])
+    inner_vectors = [
+        np.array([0.25, 0.10]),
+        np.array([0.30, 0.20]),
+        np.array([0.35, 0.10]),
+    ]
+    inner_nodes = []
+    for index, vector in enumerate(inner_vectors):
+        xx = np.zeros((2, 4))
+        xx[:, 0] = [float(index), 0.0]
+        xx[:, 2] = vector
+        inner_nodes.append(jorek_node_item(index, xx, 2))
+    edges = [SimpleNamespace(uv_index=2) for unused_index in range(2)]
+    patch = grid_editor5.extended_patch(inner_nodes, edges)
+    patch.set_radial_layers(3)
+    patch.set_outer_positions([
+        QPointF(0.0, 3.0), QPointF(1.0, 3.4), QPointF(2.0, 3.0)
+    ])
+    patch.enable_bezier_mode()
+    handles = {handle.role: handle for handle in patch.bezier_handles}
+    handles["start_tangent"].setPos(QPointF(0.6, 4.2))
+    handles["end_tangent"].setPos(QPointF(1.4, 4.2))
+    patch.update_bezier_from_handles()
+
+    scales = grid_editor5.bezier_nodal_parameter_scales(
+        patch.outer_parameters
+    )
+    expected_outer = [
+        scales[index] * np.asarray(tangent) / 3.0
+        for index, tangent in enumerate(patch.outer_tangents)
+    ]
+    assert all(
+        np.array_equal(actual, expected)
+        for actual, expected in zip(
+            patch.preview_along_vectors[0], inner_vectors
+        )
+    )
+    assert all(
+        np.allclose(actual, expected)
+        for actual, expected in zip(
+            patch.preview_along_vectors[-1], expected_outer
+        )
+    )
+    for radial_index in (1, 2):
+        fraction = radial_index / 3.0
+        for column in range(3):
+            assert np.allclose(
+                patch.preview_along_vectors[radial_index][column],
+                (1.0 - fraction) * inner_vectors[column]
+                + fraction * expected_outer[column],
+            )
+    primitive_middle = patch.positional_along_vectors(
+        patch.preview_node_rows[1]
+    )[1]
+    assert not np.allclose(
+        patch.preview_along_vectors[1][1], primitive_middle
+    )
+    assert app is not None
+
+
 def test_manual_radial_preview_builds_incrementally_per_outer_column():
     nodes_xx = np.zeros((2, 4, 3))
     nodes_xx[:, 0, :] = [[0.0, 1.0, 2.0], [0.0, 0.0, 0.0]]
@@ -1865,7 +2098,9 @@ def test_e_previews_capped_boundary_gap():
     assert app is not None
 
 
-def test_one_cap_e_stays_manual_until_bezier_mode_is_requested(monkeypatch):
+def test_one_cap_e_initializes_automatic_extent_and_allows_manual_replacement(
+    monkeypatch,
+):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
     view = this_view()
@@ -1904,11 +2139,15 @@ def test_one_cap_e_stays_manual_until_bezier_mode_is_requested(monkeypatch):
     assert patch.can_commit is True
     assert patch.bezier_mode is False
     assert patch.one_cap_topology.outer_start_node is nodes[0]
-    assert patch.outer_nodes == []
+    assert [node.position for node in patch.outer_nodes] == [
+        QPointF(0.0, 2.0), QPointF(1.0, 2.0), QPointF(2.0, 2.0)
+    ]
+    assert patch.automatic_outer_geometry
     assert patch.add_outer_node(QPointF(2.0, 2.0))
     assert [node.position for node in patch.outer_nodes] == [
         QPointF(0.0, 2.0), QPointF(1.0, 2.0), QPointF(2.0, 2.0)
     ]
+    assert not patch.automatic_outer_geometry
     assert not patch.add_outer_node(QPointF(3.0, 2.0))
 
     bezier_event = type("KeyEvent", (), {"key": lambda self: Qt.Key_B})()
@@ -2568,6 +2807,15 @@ def test_extended_patch_creates_radial_rows(
     for row in node_rows:
         for node in row:
             assert_basis_handles_match_vectors(node)
+    if bezier_mode:
+        assert all(
+            np.allclose(
+                node.xx[:, main_uv_index],
+                patch.preview_along_vectors[radial_index][column],
+            )
+            for radial_index, row in enumerate(node_rows)
+            for column, node in enumerate(row)
+        )
     assert all(
         np.linalg.norm(
             grid_editor5.np_point(created_node.position)
@@ -2684,7 +2932,8 @@ def test_extended_patch_creates_radial_rows(
             assert left_edge[1,0] == pytest.approx(0.0)
             assert left_edge[1,-1] == pytest.approx(layer_height)
             outer_edge = control_net[:,:,3]
-            assert np.all(np.diff(outer_edge[0,:]) >= 0)
+            if not (bezier_mode and radial_layers > 1):
+                assert np.all(np.diff(outer_edge[0,:]) >= 0)
             assert np.allclose(outer_edge[1,:], layer_height)
     assert all(edge.uv_index == main_uv_index for edge in outer_edges)
     assert all(edge.uv_index == radial_uv_index for edge in all_transverse_edges)
@@ -3571,6 +3820,13 @@ def test_multi_layer_two_cap_bezier_commit_preserves_final_curve(
     for radial_index, row in enumerate(node_rows):
         assert row[0] is case.start_nodes[radial_index]
         assert row[-1] is case.end_nodes[radial_index]
+        assert all(
+            np.allclose(
+                node.xx[:, main_uv_index],
+                patch.preview_along_vectors[radial_index][column],
+            )
+            for column, node in enumerate(row)
+        )
     for node, position, xx in cap_snapshots:
         assert np.array_equal(grid_editor5.np_point(node.position), position)
         assert np.array_equal(node.xx, xx)
@@ -4085,6 +4341,21 @@ def test_multi_layer_one_cap_bezier_commit_preserves_final_curve(
     )
 
     scales = grid_editor5.bezier_nodal_parameter_scales(working_parameters)
+    expected_vector_rows = [
+        list(row) for row in patch.preview_along_vectors
+    ]
+    if not cap_at_start:
+        expected_vector_rows = [
+            list(reversed(row)) for row in expected_vector_rows
+        ]
+    assert all(
+        np.allclose(
+            node.xx[:, main_uv_index],
+            expected_vector_rows[row_index][column],
+        )
+        for row_index, row in enumerate(node_rows[:-1])
+        for column, node in enumerate(row)
+    )
     for index, node in enumerate(node_rows[-1][1:], start=1):
         assert np.allclose(
             node.xx[:, main_uv_index],

@@ -831,8 +831,12 @@ def two_edge_corner_nodes(edge0, edge1):
 
 
 class extended_patch_node:
-    def __init__(self, position):
+    def __init__(self, position, along_vector=None):
         self.position = position
+        self.along_vector = (
+            None if along_vector is None
+            else np.asarray(along_vector, dtype=float)
+        )
 
 
 def order_outer_nodes(inner_nodes, outer_nodes):
@@ -1043,6 +1047,7 @@ class extended_bezier_handle(QGraphicsEllipseItem):
         self.setZValue(Z_VECTOR_HANDLE)
 
     def move_to_scene(self, scene_position):
+        self.patch.automatic_outer_geometry = False
         new_position = self.patch.mapFromScene(scene_position)
         delta = new_position - self.pos()
         self.setPos(new_position)
@@ -1069,6 +1074,7 @@ class extended_patch(QGraphicsPathItem):
         self.outer_nodes = []
         self.radial_layers = 1
         self.preview_node_rows = [self.ordered_nodes]
+        self.preview_along_vectors = []
         self.can_commit = can_commit
         self.capped_gap = None
         self.one_cap_topology = None
@@ -1076,6 +1082,8 @@ class extended_patch(QGraphicsPathItem):
         self.bezier_handles = []
         self.outer_tangents = []
         self.outer_parameters = []
+        self.base_radial_displacement = None
+        self.automatic_outer_geometry = False
         self.redraw()
 
     @property
@@ -1099,6 +1107,7 @@ class extended_patch(QGraphicsPathItem):
                     row = [cap_node] if cap_at_start else [cap_node]
                     rows.append(row)
             self.preview_node_rows = rows
+            self.preview_along_vectors = []
             return
         if defined_count == self.required_outer_node_count:
             preview_inner_nodes = self.ordered_nodes
@@ -1129,6 +1138,100 @@ class extended_patch(QGraphicsPathItem):
                 if getattr(topology, "end_cap_nodes", []):
                     rows[row_index][-1] = topology.end_cap_nodes[row_index]
         self.preview_node_rows = rows
+        self.rebuild_preview_along_vectors()
+
+    def outer_along_vectors(self):
+        main_uv_index = self.main_uv_index()
+        if self.bezier_mode:
+            if (
+                len(self.outer_tangents) != self.required_outer_node_count
+                or len(self.outer_parameters) != self.required_outer_node_count
+            ):
+                raise ValueError("Bezier samples do not match the outer row")
+            scales = bezier_nodal_parameter_scales(self.outer_parameters)
+            vectors = [
+                scales[index] * np.asarray(tangent, dtype=float) / 3.0
+                for index, tangent in enumerate(self.outer_tangents)
+            ]
+        else:
+            vectors = self.positional_along_vectors(self.outer_nodes)
+        fixed_start = self.fixed_bezier_start_node()
+        fixed_end = self.fixed_bezier_end_node()
+        if fixed_start is not None and hasattr(fixed_start, "xx"):
+            vectors[0] = np.array(fixed_start.xx[:, main_uv_index], copy=True)
+        if fixed_end is not None and hasattr(fixed_end, "xx"):
+            vectors[-1] = np.array(fixed_end.xx[:, main_uv_index], copy=True)
+        return vectors
+
+    @staticmethod
+    def positional_along_vectors(nodes):
+        positions = [np_point(node.position) for node in nodes]
+        vectors = []
+        for index in range(len(positions)):
+            if index == 0:
+                vector = (positions[1] - positions[0]) / 3.0
+            elif index == len(positions) - 1:
+                vector = (positions[-1] - positions[-2]) / 3.0
+            else:
+                vector = (positions[index + 1] - positions[index - 1]) / 6.0
+            vectors.append(vector)
+        return vectors
+
+    def rebuild_preview_along_vectors(self):
+        if (
+            len(self.preview_node_rows) != self.radial_layers + 1
+            or len(self.outer_nodes) != self.required_outer_node_count
+            or not self.ordered_edges
+            or not hasattr(self.ordered_edges[0], "uv_index")
+        ):
+            self.preview_along_vectors = []
+            return
+        main_uv_index = self.main_uv_index()
+        positional_inner_vectors = self.positional_along_vectors(
+            self.ordered_nodes
+        )
+        inner_vectors = [
+            np.array(node.xx[:, main_uv_index], copy=True)
+            if hasattr(node, "xx") else positional_inner_vectors[index]
+            for index, node in enumerate(self.ordered_nodes)
+        ]
+        outer_vectors = self.outer_along_vectors()
+        vector_rows = [inner_vectors]
+        topology = self.one_cap_topology or self.capped_gap
+        for radial_index in range(1, self.radial_layers):
+            fraction = radial_index / self.radial_layers
+            row_vectors = [
+                (1.0 - fraction) * inner_vector + fraction * outer_vector
+                for inner_vector, outer_vector in zip(
+                    inner_vectors, outer_vectors
+                )
+            ]
+            if topology is not None:
+                if (
+                    getattr(topology, "start_cap_nodes", [])
+                    and hasattr(topology.start_cap_nodes[radial_index], "xx")
+                ):
+                    row_vectors[0] = np.array(
+                        topology.start_cap_nodes[radial_index].xx[
+                            :, main_uv_index
+                        ], copy=True,
+                    )
+                if (
+                    getattr(topology, "end_cap_nodes", [])
+                    and hasattr(topology.end_cap_nodes[radial_index], "xx")
+                ):
+                    row_vectors[-1] = np.array(
+                        topology.end_cap_nodes[radial_index].xx[
+                            :, main_uv_index
+                        ], copy=True,
+                    )
+            vector_rows.append(row_vectors)
+        vector_rows.append(outer_vectors)
+        self.preview_along_vectors = vector_rows
+        for row, vectors in zip(self.preview_node_rows[1:], vector_rows[1:]):
+            for node, vector in zip(row, vectors):
+                if isinstance(node, extended_patch_node):
+                    node.along_vector = np.array(vector, copy=True)
 
     def set_radial_layers(self, nr):
         if not 1 <= nr <= 9:
@@ -1141,10 +1244,112 @@ class extended_patch(QGraphicsPathItem):
             print("Radial layer count is fixed by the selected cap chain")
             return
         self.radial_layers = nr
-        self.rebuild_intermediate_preview_rows()
-        self.redraw(rebuild_rows=False)
+        if self.automatic_outer_geometry:
+            self.regenerate_automatic_outer_geometry()
+        else:
+            self.rebuild_intermediate_preview_rows()
+            self.redraw(rebuild_rows=False)
+
+    def one_layer_radial_displacement(self):
+        if self.base_radial_displacement is not None:
+            return np.array(self.base_radial_displacement, copy=True)
+        try:
+            displacement = boundary_chain_outward_displacement(
+                self.ordered_edges
+            )
+        except (AttributeError, ValueError, NameError):
+            topology = self.one_cap_topology or self.capped_gap
+            fixed_node = None
+            inner_node = None
+            if topology is not None:
+                if topology.outer_start_node is not None:
+                    fixed_node = topology.outer_start_node
+                    inner_node = self.ordered_nodes[0]
+                elif topology.outer_end_node is not None:
+                    fixed_node = topology.outer_end_node
+                    inner_node = self.ordered_nodes[-1]
+            if fixed_node is not None:
+                displacement = (
+                    np_point(fixed_node.position) - np_point(inner_node.position)
+                ) / self.radial_layers
+            else:
+                inner_start = self.ordered_nodes[0].position
+                inner_end = self.ordered_nodes[-1].position
+                chord = inner_end - inner_start
+                chord_length = math.hypot(chord.x(), chord.y())
+                if chord_length == 0:
+                    displacement = np.array([0., -50.])
+                else:
+                    displacement = 50. * np.array([
+                        -chord.y() / chord_length,
+                        chord.x() / chord_length,
+                    ])
+        self.base_radial_displacement = np.array(displacement, copy=True)
+        return np.array(self.base_radial_displacement, copy=True)
+
+    def automatic_outer_endpoints(self):
+        topology = self.one_cap_topology or self.capped_gap
+        displacement = qt_point(
+            self.radial_layers * self.one_layer_radial_displacement()
+        )
+        start = self.ordered_nodes[0].position + displacement
+        end = self.ordered_nodes[-1].position + displacement
+        if topology is not None:
+            if topology.outer_start_node is not None:
+                start = topology.outer_start_node.position
+            if topology.outer_end_node is not None:
+                end = topology.outer_end_node.position
+        return start, end
+
+    def initialize_automatic_outer_geometry(self):
+        topology = self.one_cap_topology or self.capped_gap
+        if (
+            topology is not None
+            and topology.outer_start_node is not None
+            and topology.outer_end_node is not None
+        ):
+            return
+        start, end = self.automatic_outer_endpoints()
+        if topology is None:
+            displacement = qt_point(
+                self.radial_layers * self.one_layer_radial_displacement()
+            )
+            positions = [
+                node.position + displacement for node in self.ordered_nodes
+            ]
+        else:
+            positions = interpolate_positions(
+                start, end, len(self.ordered_edges)
+            )
+        self.set_outer_positions(positions, automatic=True)
+        if topology is not None:
+            if topology.outer_start_node is not None:
+                self.outer_nodes[0] = topology.outer_start_node
+            if topology.outer_end_node is not None:
+                self.outer_nodes[-1] = topology.outer_end_node
+            self.redraw()
+
+    def regenerate_automatic_outer_geometry(self):
+        if self.bezier_mode:
+            start, end = self.automatic_outer_endpoints()
+            handles = {handle.role: handle for handle in self.bezier_handles}
+            chord = end - start
+            if "start" in handles:
+                handles["start"].setPos(start)
+            if "end" in handles:
+                handles["end"].setPos(end)
+            if "start_tangent" in handles:
+                handles["start_tangent"].setPos(start + chord / 3.)
+            if "end_tangent" in handles:
+                handles["end_tangent"].setPos(end - chord / 3.)
+            self.update_bezier_from_handles()
+        else:
+            self.initialize_automatic_outer_geometry()
 
     def add_outer_node(self, position):
+        if self.automatic_outer_geometry:
+            self.outer_nodes = []
+            self.automatic_outer_geometry = False
         if self.one_cap_topology is not None:
             if self.outer_nodes:
                 return False
@@ -1172,12 +1377,13 @@ class extended_patch(QGraphicsPathItem):
         self.redraw()
         return True
 
-    def set_outer_positions(self, positions):
+    def set_outer_positions(self, positions, automatic=False):
         if len(positions) != self.required_outer_node_count:
             raise ValueError("Outer position count does not match inner nodes")
         self.outer_nodes = [
             extended_patch_node(position) for position in positions
         ]
+        self.automatic_outer_geometry = automatic
         self.redraw()
 
     def enable_bezier_mode(self):
@@ -1190,53 +1396,21 @@ class extended_patch(QGraphicsPathItem):
         has_end_cap = (
             topology is not None and topology.outer_end_node is not None
         )
+        has_complete_outer_row = (
+            len(self.outer_nodes) == self.required_outer_node_count
+        )
         if has_start_cap and has_end_cap:
             start = self.outer_nodes[0].position
             end = self.outer_nodes[-1].position
+        elif has_complete_outer_row:
+            start = self.outer_nodes[0].position
+            end = self.outer_nodes[-1].position
         elif has_start_cap or has_end_cap:
-            inner_start = self.ordered_nodes[0].position
-            inner_end = self.ordered_nodes[-1].position
-            try:
-                offset = qt_point(boundary_chain_outward_displacement(
-                    self.ordered_edges
-                ))
-            except (AttributeError, ValueError, NameError):
-                if has_start_cap:
-                    offset = topology.outer_start_node.position - inner_start
-                else:
-                    offset = topology.outer_end_node.position - inner_end
-            if has_start_cap:
-                start = topology.outer_start_node.position
-                end = inner_end + offset
-            else:
-                start = inner_start + offset
-                end = topology.outer_end_node.position
+            start, end = self.automatic_outer_endpoints()
+            self.automatic_outer_geometry = True
         else:
-            inner_start = self.ordered_nodes[0].position
-            inner_end = self.ordered_nodes[-1].position
-            try:
-                displacement = boundary_chain_outward_displacement(
-                    self.ordered_edges
-                )
-                offset = qt_point(displacement)
-                start = inner_start + offset
-                end = inner_end + offset
-            except (AttributeError, ValueError, NameError):
-                if len(self.outer_nodes) == self.required_outer_node_count:
-                    start = self.outer_nodes[0].position
-                    end = self.outer_nodes[-1].position
-                else:
-                    chord = inner_end - inner_start
-                    chord_length = math.hypot(chord.x(), chord.y())
-                    if chord_length == 0:
-                        offset = QPointF(0., -50.)
-                    else:
-                        offset = QPointF(
-                            -50. * chord.y() / chord_length,
-                            50. * chord.x() / chord_length,
-                        )
-                    start = inner_start + offset
-                    end = inner_end + offset
+            start, end = self.automatic_outer_endpoints()
+            self.automatic_outer_geometry = True
         chord = end - start
         start_vector = chord / 3.
         end_vector = -chord / 3.
@@ -1351,6 +1525,23 @@ class extended_patch(QGraphicsPathItem):
         self.outer_parameters = parameters
         self.redraw()
 
+    @staticmethod
+    def add_curved_preview_row(path, row, vectors):
+        path.moveTo(row[0].position)
+        for index in range(len(row) - 1):
+            start = row[index].position
+            end = row[index + 1].position
+            chord = np_point(end - start)
+            start_vector = np.asarray(vectors[index], dtype=float)
+            end_vector = np.asarray(vectors[index + 1], dtype=float)
+            start_sign = np.sign(np.inner(start_vector, chord)) or 1.0
+            end_sign = np.sign(np.inner(end_vector, -chord)) or -1.0
+            path.cubicTo(
+                start + qt_point(start_sign * start_vector),
+                end + qt_point(end_sign * end_vector),
+                end,
+            )
+
     def redraw(self, rebuild_rows=True):
         if rebuild_rows:
             self.rebuild_intermediate_preview_rows()
@@ -1388,9 +1579,19 @@ class extended_patch(QGraphicsPathItem):
                     )
                 ):
                     continue
-                path.moveTo(row[0].position)
-                for node in row[1:]:
-                    path.lineTo(node.position)
+                if (
+                    self.bezier_mode
+                    and 0 < row_index < len(self.preview_node_rows) - 1
+                    and len(self.preview_along_vectors)
+                    == len(self.preview_node_rows)
+                ):
+                    self.add_curved_preview_row(
+                        path, row, self.preview_along_vectors[row_index]
+                    )
+                else:
+                    path.moveTo(row[0].position)
+                    for node in row[1:]:
+                        path.lineTo(node.position)
             for row0, row1 in zip(
                 self.preview_node_rows[:-1], self.preview_node_rows[1:]
             ):
@@ -1881,11 +2082,12 @@ class this_view(QGraphicsView):
                 or boundary_topology.end_cap_edges
             )
             self.current_extended_patch.radial_layers = len(cap_edges)
-            self.current_extended_patch.redraw()
+            self.current_extended_patch.initialize_automatic_outer_geometry()
         else:
             self.current_extended_patch.set_radial_layers(
                 self.pending_radial_layers
             )
+            self.current_extended_patch.initialize_automatic_outer_geometry()
         self.scene().addItem(self.current_extended_patch)
         self.pending_main_uv_index = None
         print(
@@ -2890,6 +3092,7 @@ class single_element_patch_data:
         along_tangents=None, along_tangent=None, along_parameter_interval=None,
         along_edge_index=None, along_parameters=None, fixed_bezier_nodes=None,
         parameter_start_node=None, parameter_end_node=None,
+        along_basis_vectors=None, along_basis_vector=None,
     ):
         self.edges = list(edges)
         self.corner_nodes = list(corner_nodes)
@@ -2904,6 +3107,8 @@ class single_element_patch_data:
         self.fixed_bezier_nodes = list(fixed_bezier_nodes or [])
         self.parameter_start_node = parameter_start_node
         self.parameter_end_node = parameter_end_node
+        self.along_basis_vectors = along_basis_vectors
+        self.along_basis_vector = along_basis_vector
 
 
 def preview_node(point_or_node):
@@ -2915,7 +3120,7 @@ def preview_node(point_or_node):
 def add_element_from_one_edge(
     edge, point0, point1, radial_reference_nodes=None, radial_columns=None,
     along_tangents=None, along_parameter_interval=None,
-    along_edge_index=None, along_parameters=None,
+    along_edge_index=None, along_parameters=None, along_basis_vectors=None,
 ):
     patch = single_element_patch_data(
         [edge], [preview_node(point0), preview_node(point1)],
@@ -2925,6 +3130,7 @@ def add_element_from_one_edge(
         along_parameter_interval=along_parameter_interval,
         along_edge_index=along_edge_index,
         along_parameters=along_parameters,
+        along_basis_vectors=along_basis_vectors,
     )
     element_count = len(element_list)
     _add_single_element_patch_to_nodes_elements(patch)
@@ -2935,6 +3141,7 @@ def add_element_from_two_edges(
     edge0, edge1, point, radial_reference_node=None, radial_column=None,
     along_tangent=None, along_tangents=None, along_parameter_interval=None,
     along_edge_index=None, along_parameters=None, fixed_bezier_nodes=None,
+    along_basis_vector=None,
 ):
     patch = single_element_patch_data(
         [edge0, edge1], [preview_node(point)],
@@ -2946,6 +3153,7 @@ def add_element_from_two_edges(
         along_edge_index=along_edge_index,
         along_parameters=along_parameters,
         fixed_bezier_nodes=fixed_bezier_nodes,
+        along_basis_vector=along_basis_vector,
     )
     element_count = len(element_list)
     _add_single_element_patch_to_nodes_elements(patch)
@@ -3023,7 +3231,7 @@ def find_boundary_edge_between_nodes(node0, node1):
 def add_open_extended_row(
     inner_nodes, inner_edges, target_positions,
     reference_inner_nodes=None, radial_row=None,
-    along_tangents=None, along_parameters=None,
+    along_tangents=None, along_parameters=None, along_basis_vectors=None,
 ):
     """Create one radial row using the proven sequential element helpers."""
     first_new_element_index = len(element_list)
@@ -3041,6 +3249,10 @@ def add_open_extended_row(
         ),
         along_edge_index=(0 if along_parameters is not None else None),
         along_parameters=along_parameters,
+        along_basis_vectors=(
+            along_basis_vectors[:2]
+            if along_basis_vectors is not None else None
+        ),
     ) is None:
         return None
     for index in range(1, len(inner_edges)):
@@ -3065,6 +3277,10 @@ def add_open_extended_row(
             ),
             along_edge_index=(index if along_parameters is not None else None),
             along_parameters=along_parameters,
+            along_basis_vector=(
+                along_basis_vectors[index + 1]
+                if along_basis_vectors is not None else None
+            ),
         ) is None:
             return None
 
@@ -3141,6 +3357,10 @@ def add_extended_patch_to_nodes_elements(patch):
                 and radial_index == patch.radial_layers - 1
                 else None
             ),
+            along_basis_vectors=(
+                patch.preview_along_vectors[radial_index + 1]
+                if patch.bezier_mode else None
+            ),
         )
         if row_result is None:
             return
@@ -3194,6 +3414,7 @@ def add_two_cap_extended_row(
     inner_nodes, inner_edges, target_positions,
     start_cap_edge, end_cap_edge, fixed_start_node, fixed_end_node,
     reference_inner_nodes=None, along_tangents=None, along_parameters=None,
+    along_basis_vectors=None,
 ):
     """Create one radial row whose two endpoints are existing cap nodes."""
     if len(inner_nodes) != len(inner_edges) + 1:
@@ -3229,6 +3450,10 @@ def add_two_cap_extended_row(
         ):
             raise ValueError("Two-cap Bezier samples have the wrong count")
         bezier_nodal_parameter_scales(along_parameters)
+    if along_basis_vectors is not None and (
+        len(along_basis_vectors) != len(inner_nodes)
+    ):
+        raise ValueError("Two-cap along-vector row has the wrong count")
 
     first_new_node_index = len(node_list)
     first_new_element_index = len(element_list)
@@ -3260,8 +3485,12 @@ def add_two_cap_extended_row(
                     "radial_column": column + 1,
                 }
             bezier_kwargs = {}
+            if along_basis_vectors is not None:
+                bezier_kwargs["along_basis_vector"] = (
+                    along_basis_vectors[column + 1]
+                )
             if along_parameters is not None:
-                bezier_kwargs = {
+                bezier_kwargs.update({
                     "along_tangent": along_tangents[column + 1],
                     "along_tangents": along_tangents,
                     "along_parameter_interval": (
@@ -3273,7 +3502,7 @@ def add_two_cap_extended_row(
                     "fixed_bezier_nodes": (
                         [fixed_start_node] if column == 0 else None
                     ),
-                }
+                })
             if add_element_from_two_edges(
                 inner_edges[column], transverse_edge,
                 target_positions[column + 1],
@@ -3426,6 +3655,10 @@ def add_capped_gap_to_nodes_elements(patch):
                 working_parameters
                 if radial_index == patch.radial_layers - 1 else None
             ),
+            along_basis_vectors=(
+                patch.preview_along_vectors[radial_index + 1]
+                if patch.bezier_mode else None
+            ),
         )
         if row_result is None:
             return
@@ -3476,6 +3709,7 @@ def cap_first_bezier_data(patch, topology):
 def add_one_cap_extended_row(
     inner_nodes, inner_edges, target_positions, cap_edge, fixed_outer_node,
     reference_inner_nodes=None, along_tangents=None, along_parameters=None,
+    along_basis_vectors=None,
 ):
     """Create one cap-first radial row without duplicating its fixed node."""
     if len(inner_nodes) != len(inner_edges) + 1:
@@ -3507,6 +3741,10 @@ def add_one_cap_extended_row(
         ):
             raise ValueError("One-cap Bezier samples have the wrong count")
         bezier_nodal_parameter_scales(along_parameters)
+    if along_basis_vectors is not None and (
+        len(along_basis_vectors) != len(inner_nodes)
+    ):
+        raise ValueError("One-cap along-vector row has the wrong count")
 
     first_new_node_index = len(node_list)
     first_new_element_index = len(element_list)
@@ -3535,6 +3773,10 @@ def add_one_cap_extended_row(
             fixed_bezier_nodes=(
                 [fixed_outer_node]
                 if along_parameters is not None and index == 0 else None
+            ),
+            along_basis_vector=(
+                along_basis_vectors[index + 1]
+                if along_basis_vectors is not None else None
             ),
         ) is None:
             return None
@@ -3603,6 +3845,15 @@ def add_one_cap_gap_to_nodes_elements(patch):
     ) = cap_first_rows(
         topology, patch.preview_node_rows
     )
+    working_vector_rows = None
+    if patch.bezier_mode:
+        working_vector_rows = [
+            list(row) for row in patch.preview_along_vectors
+        ]
+        if not topology.start_cap_edges:
+            working_vector_rows = [
+                list(reversed(row)) for row in working_vector_rows
+            ]
     working_tangents = working_parameters = None
     if patch.bezier_mode:
         try:
@@ -3660,6 +3911,10 @@ def add_one_cap_gap_to_nodes_elements(patch):
             along_parameters=(
                 working_parameters
                 if radial_index == patch.radial_layers - 1 else None
+            ),
+            along_basis_vectors=(
+                working_vector_rows[radial_index + 1]
+                if working_vector_rows is not None else None
             ),
         )
         if row_result is None:
@@ -3782,6 +4037,7 @@ def _add_single_element_patch_to_nodes_elements(patch):
         xx[:,0,0]            = [patch.corner_nodes[0].position.x(),patch.corner_nodes[0].position.y()]
         xx[:,perp_index_0,0] = direction_0 / 3.
         along_tangent = getattr(patch, "along_tangent", None)
+        along_basis_vector = getattr(patch, "along_basis_vector", None)
         along_nodal_scales = (
             bezier_nodal_parameter_scales(patch.along_parameters)
             if along_tangent is not None else None
@@ -3792,14 +4048,20 @@ def _add_single_element_patch_to_nodes_elements(patch):
         )
         xx[:,perp_index_1,0] = (
             along_node_scale * np.asarray(along_tangent) / 3.
-            if along_tangent is not None else direction_1 / 3.
+            if along_tangent is not None
+            else np.asarray(along_basis_vector, dtype=float)
+            if along_basis_vector is not None
+            else direction_1 / 3.
         )
         xx[:,3,0]            = [0.,0.]
 
         xx = xx / this_scaling
         jorek.nodes_xx = np.append(jorek.nodes_xx,xx,2)
         new_node       = jorek_node_item(new_node_index, this_scaling * xx[:,:,0], 2)
-        if along_tangent is None or perp_index_0 == 2:
+        if (
+            (along_tangent is None and along_basis_vector is None)
+            or perp_index_0 == 2
+        ):
             orient_new_node_red_vector(
                 new_node,
                 getattr(patch, "radial_reference_node", None),
@@ -3886,6 +4148,7 @@ def _add_single_element_patch_to_nodes_elements(patch):
             patch, "radial_reference_nodes", None
         )
         along_tangents = getattr(patch, "along_tangents", None)
+        along_basis_vectors = getattr(patch, "along_basis_vectors", None)
         along_nodal_scales = (
             bezier_nodal_parameter_scales(patch.along_parameters)
             if along_tangents is not None else None
@@ -3894,8 +4157,13 @@ def _add_single_element_patch_to_nodes_elements(patch):
         reference_at_node1 = reference_at_node0 = None
         column_at_node1 = column_at_node0 = None
         tangent_at_node1 = tangent_at_node0 = None
+        basis_at_node1 = basis_at_node0 = None
         node1_match = node0_match = None
-        if radial_reference_nodes is not None or along_tangents is not None:
+        if (
+            radial_reference_nodes is not None
+            or along_tangents is not None
+            or along_basis_vectors is not None
+        ):
             supplied_positions = [
                 np_point(node.position) for node in patch.corner_nodes
             ]
@@ -3915,6 +4183,9 @@ def _add_single_element_patch_to_nodes_elements(patch):
             if along_tangents is not None:
                 tangent_at_node1 = along_tangents[node1_match]
                 tangent_at_node0 = along_tangents[node0_match]
+            if along_basis_vectors is not None:
+                basis_at_node1 = along_basis_vectors[node1_match]
+                basis_at_node0 = along_basis_vectors[node0_match]
         radial_at_node1 = direction_to_old_node1 / 3.
 
         xx         = np.zeros((2,4,1))
@@ -3924,6 +4195,8 @@ def _add_single_element_patch_to_nodes_elements(patch):
                 patch.along_edge_index + node1_match
             ] * np.asarray(tangent_at_node1) / 3.
             if tangent_at_node1 is not None
+            else np.asarray(basis_at_node1, dtype=float)
+            if basis_at_node1 is not None
             else direction_to_new_at_node0 / 3.
         )
         xx[:,perp_index,0] = radial_at_node1
@@ -3934,10 +4207,14 @@ def _add_single_element_patch_to_nodes_elements(patch):
         new_at_node1 = jorek_node_item(
             new_at_node1_index, this_scaling * xx[:,:,0], 2
         )
-        orient_new_node_red_vector(
-            new_at_node1, reference_at_node1, column_at_node1,
-            uv_index, perp_index,
-        )
+        if (
+            uv_index != 2
+            or (tangent_at_node1 is None and basis_at_node1 is None)
+        ):
+            orient_new_node_red_vector(
+                new_at_node1, reference_at_node1, column_at_node1,
+                uv_index, perp_index,
+            )
         node_list.append(new_at_node1)
         scene.addItem(new_at_node1)
         new_at_node1.update()
@@ -3958,6 +4235,8 @@ def _add_single_element_patch_to_nodes_elements(patch):
                 patch.along_edge_index + node0_match
             ] * np.asarray(tangent_at_node0) / 3.
             if tangent_at_node0 is not None
+            else np.asarray(basis_at_node0, dtype=float)
+            if basis_at_node0 is not None
             else direction_to_new_at_node1 / 3.
         )
         xx[:,perp_index,0] = radial_at_node0
@@ -3968,10 +4247,14 @@ def _add_single_element_patch_to_nodes_elements(patch):
         new_at_node0 = jorek_node_item(
             new_at_node0_index, this_scaling * xx[:,:,0], 2
         )
-        orient_new_node_red_vector(
-            new_at_node0, reference_at_node0, column_at_node0,
-            uv_index, perp_index,
-        )
+        if (
+            uv_index != 2
+            or (tangent_at_node0 is None and basis_at_node0 is None)
+        ):
+            orient_new_node_red_vector(
+                new_at_node0, reference_at_node0, column_at_node0,
+                uv_index, perp_index,
+            )
         node_list.append(new_at_node0)
         scene.addItem(new_at_node0)
         new_at_node0.update()
