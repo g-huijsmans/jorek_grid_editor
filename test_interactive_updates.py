@@ -447,6 +447,7 @@ def test_rubber_band_and_item_query_share_viewport_coordinates(monkeypatch):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
     view = this_view()
+    view.auto_fit_on_resize = False
     view.resize(320, 240)
     view.setScene(scene)
     view.show()
@@ -552,6 +553,19 @@ def test_cosmetic_boundary_edge_shape_matches_visible_screen_width(monkeypatch):
     assert app is not None
 
 
+def test_boundary_edge_normal_pen_is_pink_and_selected_pen_remains_green():
+    normal_pen = grid_editor5.boundary_edge_pen()
+    selected_pen = grid_editor5.boundary_edge_pen(Qt.green, 2.5)
+
+    assert normal_pen.color() == grid_editor5.BOUNDARY_EDGE_COLOR
+    assert normal_pen.color() == QColor(255, 105, 180)
+    assert normal_pen.widthF() == pytest.approx(
+        grid_editor5.BOUNDARY_EDGE_WIDTH
+    )
+    assert selected_pen.color() == Qt.green
+    assert selected_pen.widthF() == pytest.approx(2.5)
+
+
 def test_shift_rubberband_adds_edges_without_clearing_or_duplicates(monkeypatch):
     case = rubberband_selection_case(monkeypatch)
 
@@ -605,9 +619,9 @@ def test_ctrl_shift_rubberband_toggles_mixed_edges_and_is_reversible(
 
     assert mode == "toggle"
     assert case.view.selected_edges == [case.edges[1]]
-    assert case.edges[0].pen().color() == Qt.yellow
+    assert case.edges[0].pen().color() == grid_editor5.BOUNDARY_EDGE_COLOR
     assert case.edges[1].pen().color() == Qt.green
-    assert case.edges[2].pen().color() == Qt.yellow
+    assert case.edges[2].pen().color() == grid_editor5.BOUNDARY_EDGE_COLOR
     assert case.view.selected_nodes == [case.nodes[1], case.nodes[2]]
     assert case.view.selected_elements == [case.elements[1]]
 
@@ -618,8 +632,8 @@ def test_ctrl_shift_rubberband_toggles_mixed_edges_and_is_reversible(
     )
     assert case.view.selected_edges == [case.edges[0]]
     assert case.edges[0].pen().color() == Qt.green
-    assert case.edges[1].pen().color() == Qt.yellow
-    assert case.edges[2].pen().color() == Qt.yellow
+    assert case.edges[1].pen().color() == grid_editor5.BOUNDARY_EDGE_COLOR
+    assert case.edges[2].pen().color() == grid_editor5.BOUNDARY_EDGE_COLOR
     assert case.view.selected_nodes == [case.nodes[0], case.nodes[1]]
     assert case.view.selected_elements == [case.elements[0]]
 
@@ -652,7 +666,10 @@ def test_escape_clears_toggle_selection_and_pending_rubberband(monkeypatch):
     assert case.view.selected_elements == []
     assert case.view.rubberBand is None
     assert case.view.rubberband_mode is None
-    assert all(edge.pen().color() == Qt.yellow for edge in case.edges)
+    assert all(
+        edge.pen().color() == grid_editor5.BOUNDARY_EDGE_COLOR
+        for edge in case.edges
+    )
     assert case.app is not None
 
 
@@ -687,6 +704,7 @@ def test_resize_fits_only_active_grid_with_uniform_transform(monkeypatch):
 
     grid_rect = view.grid_bounding_rect()
     transform = view.transform()
+    assert view.auto_fit_on_resize
     assert grid_rect == grid_rect.normalized()
     assert grid_rect.left() == pytest.approx(0.0)
     assert grid_rect.right() == pytest.approx(100.0)
@@ -700,7 +718,7 @@ def test_resize_fits_only_active_grid_with_uniform_transform(monkeypatch):
     view.close()
 
 
-def test_resize_uniformly_scales_current_view_and_preserves_center():
+def test_resize_preserves_manual_view_transform_when_auto_fit_is_disabled():
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene(-1000.0, -1000.0, 2000.0, 2000.0)
     view = this_view()
@@ -712,29 +730,42 @@ def test_resize_uniformly_scales_current_view_and_preserves_center():
     view.setTransform(QTransform().scale(2.0, -2.0))
     view.zoom_level = 2.0
     view.centerOn(QPointF(125.0, -75.0))
+    view.auto_fit_on_resize = True
+    view.scrollContentsBy(1, 0)
+    assert not view.auto_fit_on_resize
     app.processEvents()
-    old_size = view.viewport().size()
-    old_center = view.mapToScene(view.viewport().rect().center())
-    old_scale = abs(view.transform().m11())
+    old_transform = QTransform(view.transform())
 
     view.resize(600, 400)
     app.processEvents()
 
-    new_size = view.viewport().size()
-    expected_factor = min(
-        new_size.width() / old_size.width(),
-        new_size.height() / old_size.height(),
-    )
-    transform = view.transform()
-    new_center = view.mapToScene(view.viewport().rect().center())
-    assert abs(transform.m11()) == pytest.approx(
-        old_scale * expected_factor, rel=1e-6
-    )
-    assert abs(transform.m11()) == pytest.approx(abs(transform.m22()))
-    assert transform.m22() < 0.0
-    assert new_center.x() == pytest.approx(old_center.x(), abs=1.0)
-    assert new_center.y() == pytest.approx(old_center.y(), abs=1.0)
-    assert view.zoom_level == pytest.approx(abs(transform.m11()))
+    assert view.transform() == old_transform
+    assert view.zoom_level == pytest.approx(2.0)
+    assert not view.auto_fit_on_resize
+    view.close()
+
+
+def test_resize_calls_fit_path_when_auto_fit_is_enabled(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    view.setScene(QGraphicsScene())
+    view.resize(300, 200)
+    view.show()
+    app.processEvents()
+    calls = []
+    real_fit = view.fit_grid_to_window
+
+    def record_fit():
+        calls.append(view.viewport().size())
+        real_fit()
+
+    monkeypatch.setattr(view, "fit_grid_to_window", record_fit)
+    view.auto_fit_on_resize = True
+    view.resize(600, 400)
+    app.processEvents()
+
+    assert calls
+    assert view.auto_fit_on_resize
     view.close()
 
 
@@ -778,6 +809,7 @@ def test_f_key_fits_active_grid_after_manual_zoom_and_pan(
     assert view.zoom_level == pytest.approx(
         np.hypot(transform.m11(), transform.m12())
     )
+    assert view.auto_fit_on_resize
     assert "fit grid to window" in capsys.readouterr().out
     view.close()
 
@@ -1621,7 +1653,7 @@ def test_escape_clears_all_selections_and_current_patch():
     view.keyPressEvent(event)
 
     assert view.selected_edges == []
-    assert edge.pen().color() == Qt.yellow
+    assert edge.pen().color() == grid_editor5.BOUNDARY_EDGE_COLOR
     assert edge.pen().widthF() == pytest.approx(
         grid_editor5.BOUNDARY_EDGE_WIDTH
     )
@@ -1777,8 +1809,8 @@ def test_e_starts_same_direction_extended_patch_and_escape_cancels(
     assert view.current_extended_patch is None
     assert state.scene() is None
     assert view.selected_edges == []
-    assert first_edge.pen().color() == Qt.yellow
-    assert second_edge.pen().color() == Qt.yellow
+    assert first_edge.pen().color() == grid_editor5.BOUNDARY_EDGE_COLOR
+    assert second_edge.pen().color() == grid_editor5.BOUNDARY_EDGE_COLOR
     assert app is not None
 
 
@@ -3179,7 +3211,36 @@ def test_grid_editor_window_wraps_independently_constructed_view():
     assert view.patch_controls is window.patch_controls
     assert window.centralWidget() is not None
     assert window.patch_controls.width() == 250
+    layout = window.centralWidget().layout()
+    assert layout.itemAt(0).widget() is window.patch_controls
+    assert layout.itemAt(1).widget() is window.view
     window.close()
+    assert app is not None
+
+
+def test_fit_button_and_f_key_use_same_fit_path(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    controls = grid_editor5.extended_patch_controls(view)
+    calls = []
+
+    def fit():
+        calls.append("fit")
+        view.auto_fit_on_resize = True
+
+    monkeypatch.setattr(view, "fit_grid_to_window", fit)
+    view.auto_fit_on_resize = False
+    controls.fit_button.click()
+    assert calls == ["fit"]
+    assert view.auto_fit_on_resize
+
+    view.auto_fit_on_resize = False
+    view.keyPressEvent(
+        type("KeyEvent", (), {"key": lambda self: Qt.Key_F})()
+    )
+    assert calls == ["fit", "fit"]
+    assert view.auto_fit_on_resize
+    assert controls.fit_button.text() == "Fit to window"
     assert app is not None
 
 

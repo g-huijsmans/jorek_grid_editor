@@ -37,7 +37,8 @@ EXTENDED_PATCH_NODE_SIZE = 6.0
 EXTENDED_BEZIER_HANDLE_SIZE = 9.0
 EXTENDED_PATCH_LINE_WIDTH = 1.75
 GRAPHICS_HANDLE_OUTLINE_WIDTH = 1.0
-BOUNDARY_EDGE_WIDTH = 1.5
+BOUNDARY_EDGE_WIDTH = 2
+BOUNDARY_EDGE_COLOR = QColor(0, 255, 255)
 STATIC_MESH_WIDTH = 0.75
 Z_STATIC_MESH = -1.0
 Z_MESH_EDGE = 0.0
@@ -73,7 +74,9 @@ _memory_diagnostic_peak_rss = None
 _diagnostic_nodes_xx_before = None
 
 
-def boundary_edge_pen(color=Qt.yellow, width=BOUNDARY_EDGE_WIDTH):
+def boundary_edge_pen(color=None, width=BOUNDARY_EDGE_WIDTH):
+    if color is None:
+        color = BOUNDARY_EDGE_COLOR
     pen = QPen(color)
     pen.setWidthF(width)
     pen.setCosmetic(True)
@@ -1448,6 +1451,8 @@ class this_view(QGraphicsView):
         self.end_point   = None
         self.rubberband_mode = None
         self.zoom_level  = 1.0
+        self.auto_fit_on_resize = True
+        self._view_adjustment_in_progress = False
         self.selected_point = None
         self.dragged_node = None
         self.pending_main_uv_index = None
@@ -1465,7 +1470,6 @@ class this_view(QGraphicsView):
         self.selected_edges = []
         self.selected_nodes = []
         self.selected_elements = []
-        self._previous_viewport_size = QSize()
 
     def grid_bounding_rect(self):
         """Return scene bounds for active mesh geometry, excluding previews."""
@@ -1507,6 +1511,7 @@ class this_view(QGraphicsView):
         return grid_rect
 
     def fit_grid_to_window(self):
+        self.auto_fit_on_resize = True
         grid_rect = self.grid_bounding_rect()
         if grid_rect is None or grid_rect.isEmpty():
             return
@@ -1519,37 +1524,28 @@ class this_view(QGraphicsView):
         fit_rect = grid_rect.adjusted(
             -margin_x, -margin_y, margin_x, margin_y
         )
-        self.fitInView(fit_rect, Qt.KeepAspectRatio)
-        transform = self.transform()
-        self.zoom_level = math.hypot(transform.m11(), transform.m12())
+        self._view_adjustment_in_progress = True
+        try:
+            self.fitInView(fit_rect, Qt.KeepAspectRatio)
+            transform = self.transform()
+            self.zoom_level = math.hypot(transform.m11(), transform.m12())
+        finally:
+            self._view_adjustment_in_progress = False
 
     def resizeEvent(self, event):
-        old_size = self._previous_viewport_size
-        if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0:
-            old_center = self.mapToScene(QPoint(
-                old_size.width() // 2, old_size.height() // 2
-            ))
-        else:
-            old_center = self.mapToScene(self.viewport().rect().center())
-        super().resizeEvent(event)
-        new_size = self.viewport().size()
-        if (
-            old_size.isValid()
-            and old_size.width() > 0
-            and old_size.height() > 0
-            and new_size.width() > 0
-            and new_size.height() > 0
-        ):
-            sx = new_size.width() / old_size.width()
-            sy = new_size.height() / old_size.height()
-            scale_factor = min(sx, sy)
-            self.scale(scale_factor, scale_factor)
-            self.centerOn(old_center)
-            transform = self.transform()
-            self.zoom_level = math.hypot(
-                transform.m11(), transform.m12()
-            )
-        self._previous_viewport_size = QSize(new_size)
+        keep_fitted = getattr(self, "auto_fit_on_resize", True)
+        self._view_adjustment_in_progress = True
+        try:
+            super().resizeEvent(event)
+        finally:
+            self._view_adjustment_in_progress = False
+        if keep_fitted:
+            self.fit_grid_to_window()
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        if not getattr(self, "_view_adjustment_in_progress", False):
+            self.auto_fit_on_resize = False
 
     def clear_selection(self):
         self.finish_rubber_band()
@@ -1719,8 +1715,14 @@ class this_view(QGraphicsView):
         self.editable_depth = depth
         if self.scene() is not None and self.scene() is globals().get("scene"):
             rebuild_graphics_layers(active_view=self)
-            self.setTransform(saved_transform)
-            self.centerOn(saved_center)
+            saved_auto_fit = self.auto_fit_on_resize
+            self._view_adjustment_in_progress = True
+            try:
+                self.setTransform(saved_transform)
+                self.centerOn(saved_center)
+            finally:
+                self._view_adjustment_in_progress = False
+                self.auto_fit_on_resize = saved_auto_fit
         self.set_patch_status("Editable depth {}".format(depth))
         self.update_patch_controls()
 
@@ -1926,6 +1928,7 @@ class this_view(QGraphicsView):
             return
         if event.key() == 85:    #   u
             print("resetting zoom_level to 1")
+            self.auto_fit_on_resize = False
             self.zoom_level = 1. 
             self.setTransform(QTransform().scale(self.zoom_level, self.zoom_level))
         if event.key() == 80:    #   p
@@ -2082,6 +2085,7 @@ class this_view(QGraphicsView):
 
         else:
             if not zoom_rect.isEmpty():
+                self.auto_fit_on_resize = False
                 viewport_rect = self.viewport().rect()
                 zoom_factor_x = viewport_rect.width()  / zoom_rect.width()
                 zoom_factor_y = viewport_rect.height() / zoom_rect.height()
@@ -2143,6 +2147,8 @@ class extended_patch_controls(QGroupBox):
         self.bezier_button = QPushButton("Enable Bézier")
         self.commit_button = QPushButton("Commit")
         self.cancel_button = QPushButton("Cancel")
+        self.fit_button = QPushButton("Fit to window")
+        layout.addWidget(self.fit_button)
         layout.addWidget(self.preview_button)
         layout.addWidget(self.bezier_button)
         button_row = QHBoxLayout()
@@ -2171,6 +2177,7 @@ class extended_patch_controls(QGroupBox):
         self.bezier_button.clicked.connect(self._enable_bezier)
         self.commit_button.clicked.connect(self._commit)
         self.cancel_button.clicked.connect(self._cancel)
+        self.fit_button.clicked.connect(self._fit_to_window)
         if view is not None:
             self.attach_view(view)
         else:
@@ -2317,6 +2324,10 @@ class extended_patch_controls(QGroupBox):
         if self.view is not None:
             self.view.cancel_current_operation()
 
+    def _fit_to_window(self):
+        if self.view is not None:
+            self.view.fit_grid_to_window()
+
 
 class grid_editor_window(QMainWindow):
     def __init__(self, graphics_view=None, parent=None):
@@ -2330,8 +2341,8 @@ class grid_editor_window(QMainWindow):
         layout = QHBoxLayout(central_widget)
         layout.setContentsMargins(4, 4, 4, 4)
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.view, 1)
         layout.addWidget(self.patch_controls, 0)
+        layout.addWidget(self.view, 1)
         self.setCentralWidget(central_widget)
         self._create_file_menu()
         self.update_window_title()
