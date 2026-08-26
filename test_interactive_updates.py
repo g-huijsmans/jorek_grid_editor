@@ -5,7 +5,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
-from PySide2.QtCore import QPoint, QPointF, Qt
+from PySide2.QtCore import QPoint, QPointF, QRect, Qt
 from PySide2.QtGui import QBrush, QColor, QPainterPath, QPen, QTransform
 from PySide2.QtWidgets import (
     QApplication, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsScene,
@@ -48,6 +48,64 @@ def install_edge_owner_lookup(monkeypatch, edges):
 
     monkeypatch.setattr(grid_editor5, "element_by_index", element_by_index)
     return owners
+
+
+def structured_editable_topology(rows=5, columns=5):
+    node_columns = columns + 1
+    elements = []
+    boundary_edges = []
+    for row in range(rows):
+        for column in range(columns):
+            index = row * columns + column
+            lower_left = row * node_columns + column
+            vertices = [
+                lower_left,
+                lower_left + 1,
+                lower_left + node_columns + 1,
+                lower_left + node_columns,
+            ]
+            elements.append(SimpleNamespace(
+                index=index, vertices=vertices, active=True
+            ))
+            if row in (0, rows - 1) or column in (0, columns - 1):
+                boundary_edges.append(SimpleNamespace(
+                    element_index=index, active=True
+                ))
+    return elements, boundary_edges
+
+
+def editable_depth_grid(size=5):
+    nodes_xx = np.zeros((2, 4, size * size))
+    for row in range(size):
+        for column in range(size):
+            index = row * size + column
+            nodes_xx[:, 0, index] = [column, row]
+            nodes_xx[:, 1, index] = [1.0, 0.0]
+            nodes_xx[:, 2, index] = [0.0, 1.0]
+    boundary = np.array([
+        int(row in (0, size - 1) or column in (0, size - 1))
+        for row in range(size)
+        for column in range(size)
+    ], dtype=np.int32)
+    vertices = []
+    for row in range(size - 1):
+        for column in range(size - 1):
+            lower_left = row * size + column
+            vertices.append([
+                lower_left, lower_left + 1,
+                lower_left + size + 1, lower_left + size,
+            ])
+    vertices = np.asarray(vertices, dtype=np.int32).T
+    element_sizes = np.zeros((4, 4, vertices.shape[1]))
+    element_sizes[0, :, :] = 1.0
+    element_sizes[1, :, :] = np.array([1, -1, -1, 1])[:, None] / 3.0
+    element_sizes[2, :, :] = np.array([1, 1, -1, -1])[:, None] / 3.0
+    return SimpleNamespace(
+        nodes_xx=nodes_xx,
+        boundary=boundary,
+        vertices=vertices,
+        elements_size=element_sizes,
+    )
 
 
 def assert_basis_handles_match_vectors(node):
@@ -315,10 +373,120 @@ def test_node_drag_keeps_press_target_when_nodes_overlap(monkeypatch):
 
     assert nodes[0].position == expected_position
     assert nodes[1].position == original_second_position
+    assert_basis_handles_match_vectors(nodes[0])
 
     release_event = SimpleNamespace(accept=lambda: None)
     view.mouseReleaseEvent(release_event)
     assert view.dragged_node is None
+    assert app is not None
+
+
+def test_rubber_band_and_item_query_share_viewport_coordinates(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.resize(320, 240)
+    view.setScene(scene)
+    view.show()
+    app.processEvents()
+
+    line_items = []
+    for screen_x in (97, 100, 103):
+        path = QPainterPath()
+        path.moveTo(view.mapToScene(QPoint(screen_x, 80)))
+        path.lineTo(view.mapToScene(QPoint(screen_x, 120)))
+        item = QGraphicsPathItem(path)
+        pen = QPen(Qt.yellow)
+        pen.setWidthF(1.0)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        scene.addItem(item)
+        line_items.append(item)
+
+    monkeypatch.setattr(
+        grid_editor5.QApplication, "keyboardModifiers", lambda: Qt.NoModifier
+    )
+    start = QPoint(100, 90)
+    end = QPoint(101, 110)
+
+    def event(position):
+        return SimpleNamespace(pos=lambda: position, accept=lambda: None)
+
+    view.mousePressEvent(event(start))
+    view.mouseMoveEvent(event(end))
+
+    query_rect = QRect(start, end).normalized()
+    band_geometry = view.rubberBand.geometry()
+    visible_rect = QRect(
+        view.viewport().mapFrom(
+            view.rubberBand.parentWidget(), band_geometry.topLeft()
+        ),
+        view.viewport().mapFrom(
+            view.rubberBand.parentWidget(), band_geometry.bottomRight()
+        ),
+    ).normalized()
+    returned_lines = [
+        item for item in view.items(query_rect) if item in line_items
+    ]
+
+    assert view.frameWidth() == 1
+    assert view.viewport().pos() == QPoint(1, 1)
+    assert view.rubberBand.parentWidget() is view.viewport()
+    assert band_geometry == query_rect
+    assert visible_rect == query_rect
+    assert returned_lines == [line_items[1]]
+    assert app is not None
+
+
+def test_cosmetic_boundary_edge_shape_matches_visible_screen_width(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.resize(320, 240)
+    view.setScene(scene)
+    view.zoom_level = 10.0
+    view.setTransform(QTransform().scale(10.0, 10.0))
+    view.setSceneRect(-1.0, -1.0, 5.0, 2.0)
+    view.show()
+    app.processEvents()
+
+    nodes_xx = np.zeros((2, 4, 4))
+    nodes_xx[0, 0, :] = np.arange(4.0)
+    nodes = [
+        SimpleNamespace(index=index, position=QPointF(float(index), 0.0))
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx),
+        raising=False,
+    )
+    monkeypatch.setattr(grid_editor5, "this_scaling", 1.0, raising=False)
+
+    edges = []
+    for index in range(3):
+        edge = grid_editor5.boundary_edge(
+            nodes[index:index + 2], [index, index + 1], [0, 1],
+            index, 0, 1, np.ones((2, 2)),
+        )
+        path = QPainterPath(QPointF(float(index), 0.0))
+        path.lineTo(QPointF(float(index + 1), 0.0))
+        edge.setPath(path)
+        scene.addItem(edge)
+        edges.append(edge)
+
+    middle = view.mapFromScene(QPointF(1.5, 0.0))
+    query_rect = QRect(middle.x() - 1, middle.y() - 1, 3, 3)
+    returned_edges = [
+        item for item in view.items(query_rect) if item in edges
+    ]
+    screen_shape = edges[1].deviceTransform(
+        view.viewportTransform()
+    ).map(edges[1].shape())
+
+    assert returned_edges == [edges[1]]
+    assert screen_shape.boundingRect().height() == pytest.approx(
+        grid_editor5.BOUNDARY_EDGE_WIDTH
+    )
     assert app is not None
 
 
@@ -626,6 +794,117 @@ def test_node_shape_only_contains_visible_marker_at_any_zoom(zoom_level):
     assert app is not None
 
 
+def test_basis_vector_handles_are_fixed_screen_items_at_construction():
+    app = QApplication.instance() or QApplication([])
+    node = jorek_node_item(0, np.zeros((2, 4)), 0)
+
+    for handle in (node.blue_handle, node.red_handle):
+        assert (
+            handle.flags()
+            & grid_editor5.QGraphicsItem.ItemIgnoresTransformations
+        )
+        assert handle.rect().width() == pytest.approx(
+            grid_editor5.VECTOR_HANDLE_SIZE
+        )
+        assert handle.rect().height() == pytest.approx(
+            grid_editor5.VECTOR_HANDLE_SIZE
+        )
+    assert app is not None
+
+
+def test_node_repaint_and_zoom_do_not_mutate_basis_handle_geometry():
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.resize(320, 240)
+    view.setScene(scene)
+    xx = np.zeros((2, 4))
+    xx[:, 1] = [2.0, 0.0]
+    xx[:, 2] = [0.0, 2.0]
+    node = jorek_node_item(0, xx, 0)
+    scene.addItem(node)
+    view.show()
+    original_rects = (
+        node.blue_handle.rect(), node.red_handle.rect()
+    )
+
+    for zoom_level in (0.1, 1.0, 10.0):
+        view.zoom_level = zoom_level
+        view.setTransform(QTransform().scale(zoom_level, zoom_level))
+        node.update()
+        view.viewport().repaint()
+        app.processEvents()
+
+        assert node.blue_handle.rect() == original_rects[0]
+        assert node.red_handle.rect() == original_rects[1]
+        for handle in (node.blue_handle, node.red_handle):
+            screen_rect = handle.deviceTransform(
+                view.viewportTransform()
+            ).mapRect(handle.rect())
+            assert screen_rect.width() == pytest.approx(
+                grid_editor5.VECTOR_HANDLE_SIZE
+            )
+            assert screen_rect.height() == pytest.approx(
+                grid_editor5.VECTOR_HANDLE_SIZE
+            )
+            assert handle in view.items(
+                view.mapFromScene(handle.scenePos())
+            )
+    assert app is not None
+
+
+@pytest.mark.parametrize(
+    "depth, expected",
+    [
+        (0, {
+            index for index in range(25)
+            if index // 5 in (0, 4) or index % 5 in (0, 4)
+        }),
+        (1, {
+            index for index in range(25)
+            if index // 5 in (0, 1, 3, 4) or index % 5 in (0, 1, 3, 4)
+        }),
+        (2, set(range(25))),
+    ],
+)
+def test_editable_depth_expands_complete_edge_rings(depth, expected):
+    elements, boundary_edges = structured_editable_topology()
+
+    editable = grid_editor5.editable_element_indices(
+        elements, boundary_edges, depth=depth
+    )
+
+    assert editable == expected
+    if depth == 0:
+        assert editable == grid_editor5.editable_boundary_element_indices(
+            elements, boundary_edges
+        )
+    assert grid_editor5.editable_node_indices(elements, editable) == {
+        vertex
+        for element in elements if element.index in expected
+        for vertex in element.vertices
+    }
+
+
+def test_editable_adjacency_excludes_node_only_and_inactive_contacts():
+    elements = [
+        SimpleNamespace(index=0, vertices=[0, 1, 2, 3], active=True),
+        SimpleNamespace(index=1, vertices=[2, 4, 5, 6], active=True),
+        SimpleNamespace(index=2, vertices=[1, 7, 8, 2], active=False),
+        SimpleNamespace(index=3, vertices=[7, 9, 10, 8], active=True),
+    ]
+    boundary_edges = [SimpleNamespace(element_index=0, active=True)]
+
+    adjacency = grid_editor5.element_edge_adjacency(elements)
+    editable = grid_editor5.editable_element_indices(
+        elements, boundary_edges, depth=9, adjacency=adjacency
+    )
+
+    assert adjacency[0] == set()
+    assert 2 not in adjacency
+    assert editable == {0}
+
+
 def test_one_edge_preview_stores_and_draws_the_endpoint_pairing():
     app = QApplication.instance() or QApplication([])
     old_node0 = type("Node", (), {"index": 4, "position": QPointF(0.0, 0.0)})()
@@ -897,6 +1176,7 @@ def test_delete_element_exposes_internal_side(monkeypatch):
     )
     deleted_element, remaining_element = elements
     view.selected_elements = [deleted_element]
+    view.editable_depth = 2
 
     grid_editor5.delete_selected_element(view)
 
@@ -913,6 +1193,8 @@ def test_delete_element_exposes_internal_side(monkeypatch):
     assert exposed_edges[0].element_index == remaining_element.index
     assert exposed_edges[0].element_side == 3
     assert exposed_edges[0].scene() is scene
+    assert view.editable_depth == 2
+    assert view.editable_element_indices_set == {remaining_element.index}
     assert nodes[0].boundary == 0
     assert nodes[3].boundary == 0
     assert nodes[0].scene() is scene
@@ -1907,10 +2189,20 @@ def test_imported_transverse_scale_is_inherited_at_old_boundary(monkeypatch):
     scene.addItem(patch)
     view.current_extended_patch = patch
     view.selected_edges = [inner_edge]
+    view.editable_depth = 2
+    commit_result = {}
+    real_commit = grid_editor5.add_extended_patch_to_nodes_elements
 
-    node_rows, created_elements = (
-        grid_editor5.add_extended_patch_to_nodes_elements(patch)
+    def capture_commit(committed_patch):
+        commit_result["value"] = real_commit(committed_patch)
+        return commit_result["value"]
+
+    monkeypatch.setattr(
+        grid_editor5, "add_extended_patch_to_nodes_elements", capture_commit
     )
+
+    assert view.commit_current_patch()
+    node_rows, created_elements = commit_result["value"]
 
     assert len(created_elements) == 1
     new_element = created_elements[0]
@@ -1958,6 +2250,9 @@ def test_imported_transverse_scale_is_inherited_at_old_boundary(monkeypatch):
         ),
         old_controls_snapshot,
     )
+    assert view.editable_depth == 2
+    assert view._element_adjacency is not None
+    assert view.editable_element_indices_set == {10, 11}
     assert app is not None
 
 
@@ -2525,6 +2820,117 @@ def test_extended_patch_panel_maps_direction_and_keyboard_state():
     view.keyPressEvent(type("KeyEvent", (), {"key": lambda self: Qt.Key_2})())
     assert view.pending_main_uv_index == 2
     assert controls.main_direction_combo.currentData() == 2
+    assert app is not None
+
+
+def test_editable_depth_control_rebuilds_overlay_without_geometry_or_view_change(
+    monkeypatch,
+):
+    app = QApplication.instance() or QApplication([])
+    for name in (
+        "jorek", "scene", "view", "node_list", "element_list",
+        "boundary_list", "static_mesh",
+    ):
+        monkeypatch.setattr(
+            grid_editor5, name, getattr(grid_editor5, name), raising=False
+        )
+    grid = editable_depth_grid()
+    scene, unused_nodes, unused_elements, unused_edges = (
+        grid_editor5.build_grid_scene(grid, 1.0)
+    )
+    view = this_view()
+    view.resize(640, 480)
+    view.setScene(scene)
+    grid_editor5.view = view
+    grid_editor5.rebuild_graphics_layers(active_view=view)
+    controls = grid_editor5.extended_patch_controls(view)
+    app.processEvents()
+
+    boundary_keys_before = {
+        frozenset(edge.vertices) for edge in grid_editor5.boundary_list
+    }
+    static_path_count = grid_editor5.static_mesh.path().elementCount()
+    nodes_xx_before = np.array(grid.nodes_xx, copy=True)
+    vertices_before = np.array(grid.vertices, copy=True)
+    sizes_before = np.array(grid.elements_size, copy=True)
+    view.setTransform(QTransform().scale(2.25, 2.25))
+    view.centerOn(QPointF(2.0, 2.0))
+    app.processEvents()
+    transform_before = QTransform(view.transform())
+    center_before = view.mapToScene(view.viewport().rect().center())
+    adjacency_before = view._element_adjacency
+    preview = QGraphicsPathItem()
+    scene.addItem(preview)
+    view.current_patch = preview
+    view.selected_edges = [grid_editor5.boundary_list[0]]
+    editable_node = next(
+        node for node in grid_editor5.node_list
+        if isinstance(node, grid_editor5.jorek_node_item)
+    )
+    view.selected_point = editable_node.blue_handle
+    view.dragged_node = editable_node
+
+    controls.editable_depth_spin.setValue(1)
+    for node in grid_editor5.node_list:
+        if not isinstance(node, grid_editor5.jorek_node_item):
+            continue
+        for handle in (node.blue_handle, node.red_handle):
+            assert (
+                handle.flags()
+                & grid_editor5.QGraphicsItem.ItemIgnoresTransformations
+            )
+            assert handle.rect().width() == pytest.approx(
+                grid_editor5.VECTOR_HANDLE_SIZE
+            )
+            assert handle.rect().height() == pytest.approx(
+                grid_editor5.VECTOR_HANDLE_SIZE
+            )
+    app.processEvents()
+
+    expected_elements = grid_editor5.editable_element_indices(
+        grid_editor5.element_list,
+        grid_editor5.boundary_list,
+        depth=1,
+        adjacency=view._element_adjacency,
+    )
+    expected_nodes = grid_editor5.editable_node_indices(
+        grid_editor5.element_list, expected_elements
+    )
+    assert view.editable_depth == 1
+    assert controls.editable_depth_spin.value() == 1
+    assert view._element_adjacency is adjacency_before
+    assert view.editable_element_indices_set == expected_elements
+    assert view.editable_node_indices_set == expected_nodes
+    assert view.current_patch is None
+    assert view.current_extended_patch is None
+    assert view.selected_edges == []
+    assert view.selected_point is None
+    assert view.dragged_node is None
+    assert {
+        element.index for element in grid_editor5.element_list
+        if isinstance(element, grid_editor5.jorek_element_item)
+    } == expected_elements
+    assert {
+        node.index for node in grid_editor5.node_list
+        if isinstance(node, grid_editor5.jorek_node_item)
+    } == expected_nodes
+    assert {
+        frozenset(edge.vertices) for edge in grid_editor5.boundary_list
+    } == boundary_keys_before
+    assert {
+        edge.element_index for edge in grid_editor5.boundary_list
+    } == grid_editor5.editable_boundary_element_indices(
+        grid_editor5.element_list, grid_editor5.boundary_list
+    )
+    assert grid_editor5.static_mesh.path().elementCount() == static_path_count
+    assert np.array_equal(grid.nodes_xx, nodes_xx_before)
+    assert np.array_equal(grid.vertices, vertices_before)
+    assert np.array_equal(grid.elements_size, sizes_before)
+    assert view.transform() == transform_before
+    center_after = view.mapToScene(view.viewport().rect().center())
+    assert center_after.x() == pytest.approx(center_before.x(), abs=0.5)
+    assert center_after.y() == pytest.approx(center_before.y(), abs=0.5)
+    assert "depth 1" in controls.editable_region_label.text()
     assert app is not None
 
 

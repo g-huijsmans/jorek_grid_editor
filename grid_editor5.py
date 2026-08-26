@@ -8,7 +8,10 @@ import time
 import ctypes
 import numpy as np
 from PySide2.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QTimer
-from PySide2.QtGui import QPen, QFont, QBrush, QColor, QMouseEvent, QPainter, QPainterPath, QTransform
+from PySide2.QtGui import (
+    QPen, QFont, QBrush, QColor, QMouseEvent, QPainter, QPainterPath,
+    QPainterPathStroker, QTransform,
+)
 from PySide2.QtWidgets import (
     QAction, QApplication, QComboBox, QFileDialog, QGraphicsEllipseItem, QGraphicsItem,
     QGraphicsPathItem, QGraphicsScene, QGraphicsView, QGroupBox,
@@ -1449,6 +1452,10 @@ class this_view(QGraphicsView):
         self.pending_main_uv_index = None
         self.pending_radial_layers = 1
         self.pending_bezier_mode = False
+        self.editable_depth = 0
+        self._element_adjacency = None
+        self.editable_element_indices_set = set()
+        self.editable_node_indices_set = set()
         self.patch_controls = None
         self.document_modified = False
         self.document_window = None
@@ -1616,6 +1623,35 @@ class this_view(QGraphicsView):
         self.pending_bezier_mode = bool(enabled)
         self.update_patch_controls()
 
+    def invalidate_element_adjacency(self):
+        self._element_adjacency = None
+
+    def set_editable_depth(self, depth):
+        depth = int(depth)
+        if not 0 <= depth <= 9:
+            raise ValueError("Editable depth must be between 0 and 9")
+        if depth == self.editable_depth:
+            self.update_patch_controls()
+            return
+
+        saved_transform = QTransform(self.transform())
+        saved_center = self.mapToScene(self.viewport().rect().center())
+        self.clear_selection()
+        self.selected_point = None
+        self.dragged_node = None
+        if self.rubberBand is not None:
+            self.rubberBand.hide()
+        self.rubberBand = None
+        self.start_point = None
+        self.end_point = None
+        self.editable_depth = depth
+        if self.scene() is not None and self.scene() is globals().get("scene"):
+            rebuild_graphics_layers(active_view=self)
+            self.setTransform(saved_transform)
+            self.centerOn(saved_center)
+        self.set_patch_status("Editable depth {}".format(depth))
+        self.update_patch_controls()
+
     def enable_current_patch_bezier(self):
         if self.current_extended_patch is None:
             print("Start an extended patch before enabling Bézier mode")
@@ -1634,7 +1670,9 @@ class this_view(QGraphicsView):
             add_extended_patch_to_nodes_elements(self.current_extended_patch)
             committed = self.current_extended_patch is None
             if committed:
-                rebuild_graphics_layers()
+                rebuild_graphics_layers(
+                    active_view=self, topology_changed=True
+                )
                 self.pending_main_uv_index = None
                 self.pending_bezier_mode = False
                 self.set_patch_status("Patch committed")
@@ -1647,7 +1685,7 @@ class this_view(QGraphicsView):
             self.update_patch_controls()
             return False
         add_patch_to_nodes_elements(self.current_patch)
-        rebuild_graphics_layers()
+        rebuild_graphics_layers(active_view=self, topology_changed=True)
         self.mark_document_modified()
         self.update_patch_controls()
         return True
@@ -1903,7 +1941,9 @@ class this_view(QGraphicsView):
                     return
       
             self.start_point = event.pos()
-            self.rubberBand = QRubberBand(QRubberBand.Rectangle, self)
+            self.rubberBand = QRubberBand(
+                QRubberBand.Rectangle, self.viewport()
+            )
             self.rubberBand.setGeometry(QRect(self.start_point, QSize()))
             self.rubberBand.show()
 
@@ -1944,7 +1984,7 @@ class this_view(QGraphicsView):
         modifiers = QApplication.keyboardModifiers()
         if modifiers == Qt.ShiftModifier:
             print("shift key pressed")
-            items = view.items(zoom_rect)
+            items = self.items(zoom_rect)
             self.selected_nodes = []
             for item in items:
                 if (
@@ -2010,6 +2050,18 @@ class extended_patch_controls(QGroupBox):
         self.selection_label.setWordWrap(True)
         layout.addWidget(self.selection_label)
 
+        layout.addWidget(QLabel("Editable depth:"))
+        self.editable_depth_spin = QSpinBox()
+        self.editable_depth_spin.setRange(0, 9)
+        self.editable_depth_spin.setToolTip(
+            "Number of element-neighbour layers inward from the boundary "
+            "that are interactively editable."
+        )
+        layout.addWidget(self.editable_depth_spin)
+        self.editable_region_label = QLabel("Editable region:\n0 elements, 0 nodes")
+        self.editable_region_label.setWordWrap(True)
+        layout.addWidget(self.editable_region_label)
+
         layout.addWidget(QLabel("Main direction:"))
         self.main_direction_combo = QComboBox()
         self.main_direction_combo.addItem("Auto", None)
@@ -2048,6 +2100,9 @@ class extended_patch_controls(QGroupBox):
 
         self.main_direction_combo.currentIndexChanged.connect(
             self._main_direction_changed
+        )
+        self.editable_depth_spin.valueChanged.connect(
+            self._editable_depth_changed
         )
         self.radial_layers_spin.valueChanged.connect(
             self._radial_layers_changed
@@ -2124,6 +2179,14 @@ class extended_patch_controls(QGroupBox):
             self.setEnabled(True)
             patch = self.view.current_extended_patch
             self.selection_label.setText(self._selection_summary())
+            self.editable_depth_spin.setValue(self.view.editable_depth)
+            self.editable_region_label.setText(
+                "Editable region:\ndepth {}, {} elements, {} nodes".format(
+                    self.view.editable_depth,
+                    len(self.view.editable_element_indices_set),
+                    len(self.view.editable_node_indices_set),
+                )
+            )
 
             direction = (
                 patch.main_uv_index()
@@ -2166,6 +2229,10 @@ class extended_patch_controls(QGroupBox):
             self.view.set_pending_main_uv_index(
                 self.main_direction_combo.currentData()
             )
+
+    def _editable_depth_changed(self, value):
+        if not self._updating and self.view is not None:
+            self.view.set_editable_depth(value)
 
     def _radial_layers_changed(self, value):
         if not self._updating and self.view is not None:
@@ -2263,7 +2330,10 @@ class grid_editor_window(QMainWindow):
             report_memory("after HDF5 read")
             (
                 new_scene, new_nodes, new_elements, new_boundaries,
-            ) = build_grid_scene(new_grid, this_scaling)
+            ) = build_grid_scene(
+                new_grid, this_scaling,
+                editable_depth=self.view.editable_depth,
+            )
             verify_diagnostic_grid_unchanged(new_grid, "after construction")
         except Exception as error:
             (
@@ -2282,6 +2352,19 @@ class grid_editor_window(QMainWindow):
         element_list = new_elements
         boundary_list = new_boundaries
         self.view.setScene(scene)
+        self.view._element_adjacency = getattr(
+            scene, "_element_adjacency", None
+        )
+        if self.view._element_adjacency is None:
+            self.view._element_adjacency = element_edge_adjacency(element_list)
+        self.view.editable_element_indices_set = editable_element_indices(
+            element_list, boundary_list,
+            depth=self.view.editable_depth,
+            adjacency=self.view._element_adjacency,
+        )
+        self.view.editable_node_indices_set = editable_node_indices(
+            element_list, self.view.editable_element_indices_set
+        )
         report_memory("after setScene")
         self.view.rubberBand = None
         self.view.start_point = None
@@ -4229,7 +4312,9 @@ def delete_selected_element(this_view):
     recompute_node_boundaries(node_list, boundary_list)
     print("after recompute_node_boundaries", flush=True)
     print("before rebuild_graphics_layers", flush=True)
-    rebuild_graphics_layers()
+    rebuild_graphics_layers(
+        active_view=this_view, topology_changed=True
+    )
     print("after rebuild_graphics_layers", flush=True)
     this_view.mark_document_modified()
 
@@ -4296,19 +4381,75 @@ class mesh_element_record:
         return None
 
 
-def editable_boundary_element_indices(elements, boundary_edges):
-    """Active elements owning at least one active boundary edge."""
+def element_edge_adjacency(elements):
+    """Return active-element neighbours connected by complete quad edges."""
+    active_elements = [
+        element for element in elements if getattr(element, "active", True)
+    ]
+    adjacency = {element.index: set() for element in active_elements}
+    owners_by_edge = {}
+    for element in active_elements:
+        if len(element.vertices) != 4:
+            raise ValueError("Editable adjacency requires quadrilateral elements")
+        for side in range(4):
+            edge_key = frozenset((
+                int(element.vertices[side]),
+                int(element.vertices[(side + 1) % 4]),
+            ))
+            owners_by_edge.setdefault(edge_key, []).append(element.index)
+
+    for owners in owners_by_edge.values():
+        for owner_index, owner in enumerate(owners):
+            adjacency[owner].update(owners[:owner_index])
+            adjacency[owner].update(owners[owner_index + 1:])
+    return adjacency
+
+
+def expand_editable_element_indices(starting_indices, adjacency, depth):
+    depth = int(depth)
+    if depth < 0:
+        raise ValueError("Editable depth must be nonnegative")
+    editable = set(starting_indices).intersection(adjacency)
+    frontier = set(editable)
+    for unused_layer in range(depth):
+        next_frontier = {
+            neighbour
+            for element_index in frontier
+            for neighbour in adjacency.get(element_index, ())
+            if neighbour not in editable
+        }
+        if not next_frontier:
+            break
+        editable.update(next_frontier)
+        frontier = next_frontier
+    return editable
+
+
+def editable_element_indices(
+    elements, boundary_edges, depth=0, adjacency=None,
+):
+    """Return active boundary owners plus ``depth`` shared-edge rings."""
     active_indices = {
         element.index for element in elements
         if getattr(element, "active", True)
     }
-    return {
+    boundary_owners = {
         edge.element_index for edge in boundary_edges
         if (
             getattr(edge, "active", True)
             and edge.element_index in active_indices
         )
     }
+    if adjacency is None:
+        adjacency = element_edge_adjacency(elements)
+    return expand_editable_element_indices(
+        boundary_owners, adjacency, depth
+    )
+
+
+def editable_boundary_element_indices(elements, boundary_edges):
+    """Backward-compatible name for the depth-0 editable element set."""
+    return editable_element_indices(elements, boundary_edges, depth=0)
 
 
 def editable_node_indices(elements, editable_element_indices):
@@ -4462,6 +4603,21 @@ class boundary_edge(QGraphicsPathItem):
                      QPointF(bezier_points[0,1,1].item(),bezier_points[1,1,1].item()),
                      QPointF(bezier_points[0,0,1].item(),bezier_points[1,0,1].item()))
         return path
+
+    def shape(self):
+        pen = self.pen()
+        stroke_width = pen.widthF()
+        if pen.isCosmetic():
+            zoom_level = 1.0
+            if self.scene() and self.scene().views():
+                zoom_level = self.scene().views()[0].zoom_level
+            stroke_width /= zoom_level
+        stroker = QPainterPathStroker()
+        stroker.setWidth(stroke_width)
+        stroker.setCapStyle(pen.capStyle())
+        stroker.setJoinStyle(pen.joinStyle())
+        stroker.setMiterLimit(pen.miterLimit())
+        return stroker.createStroke(self.path())
 
     def paint(self, painter: QPainter, option, widget=None):        
         self.points = jorek.nodes_xx[:,0:self.uv_index+1:self.uv_index,self.vertices] * this_scaling
@@ -4650,6 +4806,7 @@ class basis_vector_handle(QGraphicsEllipseItem):
         self.basis_index = basis_index
         self.setBrush(QBrush(color))
         self.setPen(graphics_handle_outline_pen())
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         self.setZValue(Z_VECTOR_HANDLE)
         self.sync_position()
 
@@ -4849,13 +5006,6 @@ class jorek_node_item(QGraphicsItem):
         self.ellipse_item.setPen(QPen(Qt.black, 1./zoom_level))
         self.ellipse_item.paint(painter,option)
 
-        handle_size = VECTOR_HANDLE_SIZE / zoom_level
-        handle_rect = QRectF(
-            -handle_size / 2., -handle_size / 2., handle_size, handle_size
-        )
-        self.blue_handle.setRect(handle_rect)
-        self.red_handle.setRect(handle_rect)
-        
         painter.setPen(QPen(Qt.white))
         font_size = int(10 / zoom_level)
         painter.setFont(QFont("Arial",font_size))
@@ -4906,11 +5056,16 @@ def live_grid_arrays():
     return nodes_xx, boundary, vertices, element_sizes
 
 
-def rebuild_graphics_layers():
-    """Recompute the depth-0 editable overlay and static mesh."""
+def rebuild_graphics_layers(active_view=None, topology_changed=False):
+    """Recompute the configured editable overlay and static mesh."""
     global static_mesh
     if scene is None:
         return set(), set()
+    if active_view is None:
+        active_view = globals().get("view")
+    if topology_changed and active_view is not None:
+        active_view.invalidate_element_adjacency()
+        scene._element_adjacency = None
 
     boundary_specs = []
     for edge in boundary_list:
@@ -4922,8 +5077,20 @@ def rebuild_graphics_layers():
             continue
         boundary_specs.append((element_index, element_side, edge.vertices))
 
-    editable_elements = editable_boundary_element_indices(
-        element_list, boundary_list
+    if active_view is not None:
+        if active_view._element_adjacency is None:
+            active_view._element_adjacency = element_edge_adjacency(
+                element_list
+            )
+            scene._element_adjacency = active_view._element_adjacency
+        adjacency = active_view._element_adjacency
+        depth = active_view.editable_depth
+    else:
+        adjacency = element_edge_adjacency(element_list)
+        scene._element_adjacency = adjacency
+        depth = 0
+    editable_elements = editable_element_indices(
+        element_list, boundary_list, depth=depth, adjacency=adjacency
     )
     editable_nodes = editable_node_indices(element_list, editable_elements)
     old_boundary_edges = set(boundary_list)
@@ -5018,8 +5185,9 @@ def rebuild_graphics_layers():
     else:
         static_mesh.rebuild_path()
 
-    active_view = globals().get("view")
     if active_view is not None:
+        active_view.editable_element_indices_set = set(editable_elements)
+        active_view.editable_node_indices_set = set(editable_nodes)
         active_view.selected_nodes = []
         active_view.selected_elements = []
         active_view.selected_edges = []
@@ -5029,7 +5197,7 @@ def rebuild_graphics_layers():
     return editable_elements, editable_nodes
 
 
-def build_grid_scene(grid, scaling):
+def build_grid_scene(grid, scaling, editable_depth=0):
     """Construct a complete replacement scene from validated grid arrays."""
     global jorek, scene, node_list, element_list, boundary_list, static_mesh
     jorek_grid.validate_grid_arrays(
@@ -5069,7 +5237,13 @@ def build_grid_scene(grid, scaling):
                 if node_list[vertex0].boundary and node_list[vertex1].boundary:
                     boundary_sides.append((element.index, element_side))
 
-        editable_elements = {index for index, unused_side in boundary_sides}
+        adjacency = element_edge_adjacency(element_list)
+        scene._element_adjacency = adjacency
+        editable_elements = expand_editable_element_indices(
+            {index for index, unused_side in boundary_sides},
+            adjacency,
+            editable_depth,
+        )
         editable_nodes = editable_node_indices(element_list, editable_elements)
         for node_index in editable_nodes:
             record = node_list[node_index]
