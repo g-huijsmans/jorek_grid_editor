@@ -972,6 +972,28 @@ def element_by_index(element_index):
     )
 
 
+def effective_node_basis_vector(node, basis_index, owner_edge=None):
+    """Return one nodal basis as an effective scene-space control vector."""
+    owner = (
+        element_by_index(getattr(owner_edge, "element_index", None))
+        if (
+            owner_edge is not None
+            and hasattr(owner_edge, "nodes")
+            and hasattr(owner_edge, "sizes")
+        ) else None
+    )
+    if owner is not None and hasattr(owner, "sizes"):
+        local_vertices = [
+            local_vertex
+            for local_vertex, vertex in enumerate(owner.vertices)
+            if vertex == node.index
+        ]
+        if len(local_vertices) == 1:
+            scale = float(owner.sizes[basis_index, local_vertices[0]])
+            return scale * np.asarray(node.xx[:, basis_index], dtype=float)
+    return np.asarray(node_basis_display_vector(node, basis_index), dtype=float)
+
+
 def boundary_chain_outward_displacement(ordered_edges):
     outward_normals = []
     transverse_lengths = []
@@ -1158,9 +1180,25 @@ class extended_patch(QGraphicsPathItem):
         fixed_start = self.fixed_bezier_start_node()
         fixed_end = self.fixed_bezier_end_node()
         if fixed_start is not None and hasattr(fixed_start, "xx"):
-            vectors[0] = np.array(fixed_start.xx[:, main_uv_index], copy=True)
+            topology = self.one_cap_topology or self.capped_gap
+            owner_edges = getattr(topology, "start_cap_edges", []) or []
+            vector = effective_node_basis_vector(
+                fixed_start, main_uv_index,
+                owner_edges[-1] if owner_edges else None,
+            )
+            if np.inner(vector, vectors[0]) < 0.0:
+                vector = -vector
+            vectors[0] = vector
         if fixed_end is not None and hasattr(fixed_end, "xx"):
-            vectors[-1] = np.array(fixed_end.xx[:, main_uv_index], copy=True)
+            topology = self.one_cap_topology or self.capped_gap
+            owner_edges = getattr(topology, "end_cap_edges", []) or []
+            vector = effective_node_basis_vector(
+                fixed_end, main_uv_index,
+                owner_edges[-1] if owner_edges else None,
+            )
+            if np.inner(vector, vectors[-1]) < 0.0:
+                vector = -vector
+            vectors[-1] = vector
         return vectors
 
     @staticmethod
@@ -1190,11 +1228,18 @@ class extended_patch(QGraphicsPathItem):
         positional_inner_vectors = self.positional_along_vectors(
             self.ordered_nodes
         )
-        inner_vectors = [
-            np.array(node.xx[:, main_uv_index], copy=True)
-            if hasattr(node, "xx") else positional_inner_vectors[index]
-            for index, node in enumerate(self.ordered_nodes)
-        ]
+        inner_vectors = []
+        for index, node in enumerate(self.ordered_nodes):
+            if hasattr(node, "xx"):
+                owner_edge = self.ordered_edges[max(0, index - 1)]
+                vector = effective_node_basis_vector(
+                    node, main_uv_index, owner_edge
+                )
+                if np.inner(vector, positional_inner_vectors[index]) < 0.0:
+                    vector = -vector
+                inner_vectors.append(vector)
+            else:
+                inner_vectors.append(positional_inner_vectors[index])
         outer_vectors = self.outer_along_vectors()
         vector_rows = [inner_vectors]
         topology = self.one_cap_topology or self.capped_gap
@@ -1207,24 +1252,31 @@ class extended_patch(QGraphicsPathItem):
                 )
             ]
             if topology is not None:
+                positional_row_vectors = self.positional_along_vectors(
+                    self.preview_node_rows[radial_index]
+                )
                 if (
                     getattr(topology, "start_cap_nodes", [])
                     and hasattr(topology.start_cap_nodes[radial_index], "xx")
                 ):
-                    row_vectors[0] = np.array(
-                        topology.start_cap_nodes[radial_index].xx[
-                            :, main_uv_index
-                        ], copy=True,
+                    vector = effective_node_basis_vector(
+                        topology.start_cap_nodes[radial_index], main_uv_index,
+                        topology.start_cap_edges[radial_index - 1],
                     )
+                    if np.inner(vector, positional_row_vectors[0]) < 0.0:
+                        vector = -vector
+                    row_vectors[0] = vector
                 if (
                     getattr(topology, "end_cap_nodes", [])
                     and hasattr(topology.end_cap_nodes[radial_index], "xx")
                 ):
-                    row_vectors[-1] = np.array(
-                        topology.end_cap_nodes[radial_index].xx[
-                            :, main_uv_index
-                        ], copy=True,
+                    vector = effective_node_basis_vector(
+                        topology.end_cap_nodes[radial_index], main_uv_index,
+                        topology.end_cap_edges[radial_index - 1],
                     )
+                    if np.inner(vector, positional_row_vectors[-1]) < 0.0:
+                        vector = -vector
+                    row_vectors[-1] = vector
             vector_rows.append(row_vectors)
         vector_rows.append(outer_vectors)
         self.preview_along_vectors = vector_rows
@@ -1474,8 +1526,11 @@ class extended_patch(QGraphicsPathItem):
         start = np_point(self.bezier_start_position())
         end = np_point(self.bezier_end_position())
         if fixed_node is not None:
-            vector = np.array(
-                fixed_node.xx[:,self.main_uv_index()], copy=True
+            topology = self.one_cap_topology or self.capped_gap
+            owner_edges = getattr(topology, "start_cap_edges", []) or []
+            vector = effective_node_basis_vector(
+                fixed_node, self.main_uv_index(),
+                owner_edges[-1] if owner_edges else None,
             )
             if np.inner(vector, end - start) < 0:
                 vector = -vector
@@ -1491,8 +1546,11 @@ class extended_patch(QGraphicsPathItem):
         start = np_point(self.bezier_start_position())
         end = np_point(self.bezier_end_position())
         if fixed_node is not None:
-            vector = np.array(
-                fixed_node.xx[:,self.main_uv_index()], copy=True
+            topology = self.one_cap_topology or self.capped_gap
+            owner_edges = getattr(topology, "end_cap_edges", []) or []
+            vector = effective_node_basis_vector(
+                fixed_node, self.main_uv_index(),
+                owner_edges[-1] if owner_edges else None,
             )
             if np.inner(vector, start - end) < 0:
                 vector = -vector
@@ -1666,6 +1724,8 @@ class this_view(QGraphicsView):
         self.patch_controls = None
         self.document_modified = False
         self.document_window = None
+        self.last_geometry_undo = None
+        self._geometry_drag_snapshot = None
         self.current_patch = None
         self.current_extended_patch = None
         self.selected_edges = []
@@ -1862,6 +1922,107 @@ class this_view(QGraphicsView):
         self.document_modified = True
         if self.document_window is not None:
             self.document_window.update_window_title()
+
+    def clear_geometry_undo(self):
+        self.last_geometry_undo = None
+        self._geometry_drag_snapshot = None
+
+    def begin_geometry_drag(self, node, edit_kind):
+        self._geometry_drag_snapshot = None
+        node_index = getattr(node, "index", None)
+        nodes_xx = getattr(globals().get("jorek"), "nodes_xx", None)
+        if (
+            node_index is None
+            or nodes_xx is None
+            or node_index < 0
+            or node_index >= nodes_xx.shape[2]
+        ):
+            return
+        self._geometry_drag_snapshot = {
+            "node_index": int(node_index),
+            "nodes_xx": np.array(nodes_xx[:, :, node_index], copy=True),
+            "kind": edit_kind,
+        }
+
+    def complete_geometry_drag(self):
+        snapshot = self._geometry_drag_snapshot
+        self._geometry_drag_snapshot = None
+        if snapshot is None:
+            return False
+        node_index = snapshot["node_index"]
+        nodes_xx = getattr(globals().get("jorek"), "nodes_xx", None)
+        if (
+            nodes_xx is None
+            or node_index < 0
+            or node_index >= nodes_xx.shape[2]
+        ):
+            return False
+        if np.array_equal(
+            nodes_xx[:, :, node_index], snapshot["nodes_xx"]
+        ):
+            return False
+        self.last_geometry_undo = snapshot
+        return True
+
+    def refresh_geometry_for_node(self, node_index):
+        nodes_xx = getattr(globals().get("jorek"), "nodes_xx", None)
+        if (
+            nodes_xx is None
+            or node_index < 0
+            or node_index >= nodes_xx.shape[2]
+            or node_index >= len(globals().get("node_list", []))
+        ):
+            return False
+        node = node_list[node_index]
+        if getattr(node, "index", None) != node_index:
+            return False
+        if isinstance(node, QGraphicsItem):
+            node.prepareGeometryChange()
+        node.xx = this_scaling * np.array(
+            nodes_xx[:, :, node_index], copy=True
+        )
+        node.position = qt_point(node.xx[:, 0])
+        if isinstance(node, jorek_node_item):
+            node.ellipse_item.setPos(node.position)
+            node.blue_handle.sync_position()
+            node.red_handle.sync_position()
+            node.update_connected_items()
+        else:
+            node.update()
+        if self.current_extended_patch is not None:
+            self.current_extended_patch.redraw()
+        if self.current_patch is not None:
+            self.current_patch.update()
+        rebuild_static_mesh_path(self.scene())
+        if self.scene() is not None:
+            self.scene().update()
+        return True
+
+    def undo_last_geometry_edit(self):
+        if self.dragged_node is not None or self.selected_point is not None:
+            return False
+        snapshot = self.last_geometry_undo
+        if snapshot is None:
+            return False
+        self.last_geometry_undo = None
+        node_index = snapshot["node_index"]
+        nodes_xx = getattr(globals().get("jorek"), "nodes_xx", None)
+        if (
+            nodes_xx is None
+            or node_index < 0
+            or node_index >= nodes_xx.shape[2]
+            or nodes_xx[:, :, node_index].shape != snapshot["nodes_xx"].shape
+        ):
+            return False
+        nodes_xx[:, :, node_index] = snapshot["nodes_xx"]
+        if not self.refresh_geometry_for_node(node_index):
+            return False
+        self.mark_document_modified()
+        self.set_patch_status(
+            "Undid node move"
+            if snapshot["kind"] == "node" else "Undid basis-vector move"
+        )
+        return True
 
     def update_patch_controls(self):
         if self.patch_controls is not None:
@@ -2108,6 +2269,17 @@ class this_view(QGraphicsView):
 
     def keyPressEvent(self, event):
         print("key pressed: ",event.key())
+        modifiers = (
+            event.modifiers()
+            if hasattr(event, "modifiers")
+            else QApplication.keyboardModifiers()
+        )
+        if (
+            event.key() == Qt.Key_Z
+            and modifiers & Qt.ControlModifier
+        ):
+            self.undo_last_geometry_edit()
+            return
         if event.key() == Qt.Key_F:
             print("fit grid to window")
             self.fit_grid_to_window()
@@ -2211,6 +2383,10 @@ class this_view(QGraphicsView):
                     )
                 ):
                     self.selected_point = item
+                    if isinstance(item, basis_vector_handle):
+                        self.begin_geometry_drag(
+                            item.node, "basis-vector"
+                        )
                     event.accept()
                     return
                 if (
@@ -2218,6 +2394,7 @@ class this_view(QGraphicsView):
                     and getattr(item, "active", True)
                 ):
                     self.dragged_node = item
+                    self.begin_geometry_drag(item, "node")
                     event.accept()
                     return
       
@@ -2253,11 +2430,14 @@ class this_view(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         if self.selected_point:
+            if isinstance(self.selected_point, basis_vector_handle):
+                self.complete_geometry_drag()
             self.selected_point = None
             rebuild_static_mesh_path(self.scene())
             event.accept()
             return
         if self.dragged_node is not None:
+            self.complete_geometry_drag()
             self.dragged_node = None
             rebuild_static_mesh_path(self.scene())
             event.accept()
@@ -2622,6 +2802,7 @@ class grid_editor_window(QMainWindow):
         element_list = new_elements
         boundary_list = new_boundaries
         self.view.setScene(scene)
+        self.view.clear_geometry_undo()
         self.view._element_adjacency = getattr(
             scene, "_element_adjacency", None
         )
@@ -5411,6 +5592,8 @@ def live_grid_arrays():
 def rebuild_graphics_layers(active_view=None, topology_changed=False):
     """Recompute the configured editable overlay and static mesh."""
     global static_mesh
+    if active_view is not None and topology_changed:
+        active_view.clear_geometry_undo()
     if scene is None:
         return set(), set()
     if active_view is None:

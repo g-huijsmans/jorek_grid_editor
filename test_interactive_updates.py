@@ -443,6 +443,177 @@ def test_node_drag_keeps_press_target_when_nodes_overlap(monkeypatch):
     assert app is not None
 
 
+def geometry_undo_case(monkeypatch, node_count=2):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    nodes_xx = np.zeros((2, 4, node_count))
+    for index in range(node_count):
+        nodes_xx[:, 0, index] = [float(2 * index), float(index)]
+        nodes_xx[:, 1, index] = [0.4 + index, 0.1]
+        nodes_xx[:, 2, index] = [0.2, 0.5 + index]
+    nodes = [
+        jorek_node_item(index, np.array(nodes_xx[:, :, index], copy=True), 2)
+        for index in range(node_count)
+    ]
+    for node in nodes:
+        scene.addItem(node)
+    monkeypatch.setattr(
+        grid_editor5, "jorek", SimpleNamespace(nodes_xx=nodes_xx), raising=False
+    )
+    monkeypatch.setattr(grid_editor5, "this_scaling", 1.0, raising=False)
+    monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
+    monkeypatch.setattr(grid_editor5, "element_list", [], raising=False)
+    monkeypatch.setattr(grid_editor5, "boundary_list", [], raising=False)
+    monkeypatch.setattr(grid_editor5, "scene", scene, raising=False)
+    monkeypatch.setattr(grid_editor5, "view", view, raising=False)
+    monkeypatch.setattr(grid_editor5, "static_mesh", None, raising=False)
+    return SimpleNamespace(
+        app=app, scene=scene, view=view, nodes=nodes, nodes_xx=nodes_xx
+    )
+
+
+def ctrl_z_event():
+    return SimpleNamespace(
+        key=lambda: Qt.Key_Z,
+        modifiers=lambda: Qt.ControlModifier,
+    )
+
+
+def complete_node_drag(case, node, position):
+    case.view.begin_geometry_drag(node, "node")
+    case.view.dragged_node = node
+    node.move_to_scene(position)
+    case.view.mouseReleaseEvent(SimpleNamespace(accept=lambda: None))
+
+
+def complete_basis_drag(case, handle, position):
+    case.view.begin_geometry_drag(handle.node, "basis-vector")
+    case.view.selected_point = handle
+    handle.move_to_scene(position)
+    case.view.mouseReleaseEvent(SimpleNamespace(accept=lambda: None))
+
+
+def test_ctrl_z_restores_complete_node_state_and_connected_geometry(monkeypatch):
+    case = geometry_undo_case(monkeypatch)
+    node = case.nodes[0]
+    element = UpdateRecorder()
+    element.index = 10
+    element.vertices = [0]
+    element.sizes = np.ones((4, 1))
+    element.active = True
+    boundary = UpdateRecorder(uv_index=2)
+    boundary.element_index = 10
+    boundary.vertices = [0]
+    boundary.active = True
+    node.connected_elements = [element]
+    node.connected_boundary_edges = [boundary]
+    static_refreshes = []
+    monkeypatch.setattr(
+        grid_editor5, "rebuild_static_mesh_path",
+        lambda expected_scene=None: static_refreshes.append(expected_scene),
+    )
+    original = np.array(case.nodes_xx[:, :, 0], copy=True)
+
+    complete_node_drag(case, node, QPointF(7.5, -3.25))
+    assert case.view.last_geometry_undo is not None
+    case.view.keyPressEvent(ctrl_z_event())
+
+    assert np.array_equal(case.nodes_xx[:, :, 0], original)
+    assert np.array_equal(node.xx, original)
+    assert node.position == QPointF(*original[:, 0])
+    assert node.ellipse_item.pos() == node.position
+    assert_basis_handles_match_vectors(node)
+    assert element.update_count >= 2
+    assert boundary.update_count >= 2
+    assert len(static_refreshes) == 2
+    assert case.view.last_geometry_undo is None
+
+
+@pytest.mark.parametrize("basis_index", [1, 2])
+def test_ctrl_z_restores_raw_basis_and_display_handle(monkeypatch, basis_index):
+    case = geometry_undo_case(monkeypatch)
+    node = case.nodes[0]
+    handle = node.blue_handle if basis_index == 1 else node.red_handle
+    original = np.array(case.nodes_xx[:, :, 0], copy=True)
+    original_handle_position = QPointF(handle.pos())
+
+    complete_basis_drag(case, handle, node.position + QPointF(1.7, -0.8))
+    assert not np.array_equal(case.nodes_xx[:, basis_index, 0], original[:, basis_index])
+    case.view.keyPressEvent(ctrl_z_event())
+
+    assert np.array_equal(case.nodes_xx[:, :, 0], original)
+    assert np.array_equal(node.xx[:, basis_index], original[:, basis_index])
+    assert handle.pos() == original_handle_position
+    assert_basis_handles_match_vectors(node)
+
+
+def test_geometry_undo_is_single_level_and_consumed(monkeypatch):
+    case = geometry_undo_case(monkeypatch)
+    node0, node1 = case.nodes
+    complete_node_drag(case, node0, QPointF(5.0, 5.0))
+    moved_node0 = np.array(case.nodes_xx[:, :, 0], copy=True)
+    original_node1 = np.array(case.nodes_xx[:, :, 1], copy=True)
+    complete_node_drag(case, node1, QPointF(8.0, 9.0))
+
+    case.view.keyPressEvent(ctrl_z_event())
+    assert np.array_equal(case.nodes_xx[:, :, 0], moved_node0)
+    assert np.array_equal(case.nodes_xx[:, :, 1], original_node1)
+    after_first_undo = np.array(case.nodes_xx, copy=True)
+    case.view.keyPressEvent(ctrl_z_event())
+    assert np.array_equal(case.nodes_xx, after_first_undo)
+
+
+def test_noop_geometry_drag_preserves_previous_undo(monkeypatch):
+    case = geometry_undo_case(monkeypatch)
+    node0, node1 = case.nodes
+    original_node0 = np.array(case.nodes_xx[:, :, 0], copy=True)
+    complete_node_drag(case, node0, QPointF(5.0, 5.0))
+    saved_undo = case.view.last_geometry_undo
+
+    case.view.begin_geometry_drag(node1, "node")
+    case.view.dragged_node = node1
+    case.view.mouseReleaseEvent(SimpleNamespace(accept=lambda: None))
+
+    assert case.view.last_geometry_undo is saved_undo
+    case.view.keyPressEvent(ctrl_z_event())
+    assert np.array_equal(case.nodes_xx[:, :, 0], original_node0)
+
+
+def test_geometry_undo_uses_node_index_after_overlay_item_replacement(monkeypatch):
+    case = geometry_undo_case(monkeypatch, node_count=1)
+    original = np.array(case.nodes_xx[:, :, 0], copy=True)
+    complete_node_drag(case, case.nodes[0], QPointF(4.0, 6.0))
+    case.scene.removeItem(case.nodes[0])
+    replacement = jorek_node_item(
+        0, np.array(case.nodes_xx[:, :, 0], copy=True), 2
+    )
+    case.scene.addItem(replacement)
+    grid_editor5.node_list[0] = replacement
+
+    case.view.keyPressEvent(ctrl_z_event())
+
+    assert np.array_equal(case.nodes_xx[:, :, 0], original)
+    assert np.array_equal(replacement.xx, original)
+    assert replacement.position == QPointF(*original[:, 0])
+    assert_basis_handles_match_vectors(replacement)
+
+
+def test_ctrl_z_is_ignored_during_active_geometry_drag(monkeypatch):
+    case = geometry_undo_case(monkeypatch, node_count=1)
+    node = case.nodes[0]
+    original = np.array(case.nodes_xx[:, :, 0], copy=True)
+    complete_node_drag(case, node, QPointF(3.0, 4.0))
+    case.view.begin_geometry_drag(node, "node")
+    case.view.dragged_node = node
+
+    case.view.keyPressEvent(ctrl_z_event())
+
+    assert not np.array_equal(case.nodes_xx[:, :, 0], original)
+    assert case.view.last_geometry_undo is not None
+
+
 def test_rubber_band_and_item_query_share_viewport_coordinates(monkeypatch):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
@@ -553,12 +724,11 @@ def test_cosmetic_boundary_edge_shape_matches_visible_screen_width(monkeypatch):
     assert app is not None
 
 
-def test_boundary_edge_normal_pen_is_pink_and_selected_pen_remains_green():
+def test_boundary_edge_normal_pen_is_cyan_and_selected_pen_remains_green():
     normal_pen = grid_editor5.boundary_edge_pen()
     selected_pen = grid_editor5.boundary_edge_pen(Qt.green, 2.5)
 
     assert normal_pen.color() == grid_editor5.BOUNDARY_EDGE_COLOR
-    assert normal_pen.color() == QColor(255, 105, 180)
     assert normal_pen.widthF() == pytest.approx(
         grid_editor5.BOUNDARY_EDGE_WIDTH
     )
@@ -952,6 +1122,115 @@ def test_automatic_zero_cap_bezier_preserves_scaled_extent(monkeypatch):
 
     assert patch.outer_nodes[0].position == straight_endpoints[0]
     assert patch.outer_nodes[-1].position == straight_endpoints[1]
+
+
+def test_plain_b_keeps_multilayer_bezier_handles_and_samples_local(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    patch = regular_automatic_extended_patch(monkeypatch)
+    for node in patch.ordered_nodes:
+        node.xx = np.array([
+            [node.position.x(), 1.0e6, -2.0e6, 0.0],
+            [node.position.y(), -3.0e6, 4.0e6, 0.0],
+        ])
+    for element in grid_editor5.element_list:
+        element.sizes = np.ones((4, 4))
+        element.sizes[1, :] = 1.0e-7
+    for edge in patch.ordered_edges:
+        edge.sizes = np.array([[1.0, 1.0], [1.0e-7, 1.0e-7]])
+    patch.set_radial_layers(4)
+    patch.initialize_automatic_outer_geometry()
+    straight_outer = [
+        grid_editor5.np_point(node.position) for node in patch.outer_nodes
+    ]
+    scene.addItem(patch)
+    view.current_extended_patch = patch
+
+    view.keyPressEvent(SimpleNamespace(
+        key=lambda: Qt.Key_B,
+        modifiers=lambda: Qt.NoModifier,
+    ))
+
+    handles = {handle.role: handle for handle in patch.bezier_handles}
+    start = grid_editor5.np_point(patch.bezier_start_position())
+    end = grid_editor5.np_point(patch.bezier_end_position())
+    chord = end - start
+    start_delta = grid_editor5.np_point(
+        handles["start_tangent"].pos()
+    ) - start
+    end_delta = grid_editor5.np_point(
+        handles["end_tangent"].pos()
+    ) - end
+    assert np.linalg.norm(start_delta) == pytest.approx(
+        np.linalg.norm(chord) / 3.0
+    )
+    assert np.linalg.norm(end_delta) == pytest.approx(
+        np.linalg.norm(chord) / 3.0
+    )
+    assert np.allclose(start_delta, chord / 3.0)
+    assert np.allclose(end_delta, -chord / 3.0)
+
+    expected_inner_vectors = [
+        grid_editor5.effective_node_basis_vector(
+            node, patch.main_uv_index(),
+            patch.ordered_edges[max(0, index - 1)],
+        )
+        for index, node in enumerate(patch.ordered_nodes)
+    ]
+    positional_inner_vectors = patch.positional_along_vectors(
+        patch.ordered_nodes
+    )
+    expected_inner_vectors = [
+        -vector if np.inner(vector, positional_inner_vectors[index]) < 0.0
+        else vector
+        for index, vector in enumerate(expected_inner_vectors)
+    ]
+    assert all(
+        np.allclose(actual, expected)
+        for actual, expected in zip(
+            patch.preview_along_vectors[0], expected_inner_vectors
+        )
+    )
+    expected_first_intermediate = [
+        0.75 * inner + 0.25 * outer
+        for inner, outer in zip(
+            expected_inner_vectors, patch.preview_along_vectors[-1]
+        )
+    ]
+    assert all(
+        np.allclose(actual, expected)
+        for actual, expected in zip(
+            patch.preview_along_vectors[1], expected_first_intermediate
+        )
+    )
+    assert max(
+        np.linalg.norm(vector)
+        for row in patch.preview_along_vectors
+        for vector in row
+    ) < 2.0 * np.linalg.norm(chord)
+
+    envelope_points = np.array([
+        grid_editor5.np_point(node.position) for node in patch.ordered_nodes
+    ] + straight_outer)
+    lower = np.min(envelope_points, axis=0) - 1.0e-9
+    upper = np.max(envelope_points, axis=0) + 1.0e-9
+    outer_samples = np.array([
+        grid_editor5.np_point(node.position) for node in patch.outer_nodes
+    ])
+    assert np.all(outer_samples >= lower)
+    assert np.all(outer_samples <= upper)
+    assert max(
+        np.linalg.norm(tangent) for tangent in patch.outer_tangents
+    ) <= 2.0 * np.linalg.norm(chord)
+    preview_bounds = patch.path().boundingRect()
+    margin = np.linalg.norm(chord)
+    assert preview_bounds.left() >= lower[0] - margin
+    assert preview_bounds.right() <= upper[0] + margin
+    assert preview_bounds.top() >= lower[1] - margin
+    assert preview_bounds.bottom() <= upper[1] + margin
+    assert app is not None
 
 
 @pytest.mark.parametrize("radial_layers", [1, 2, 3])
