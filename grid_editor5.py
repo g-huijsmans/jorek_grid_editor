@@ -31,9 +31,10 @@ jorek_grid = jorek
 
 
 NODE_MARKER_SIZE = 8.0
+NODE_COLOR = QColor(60, 60, 60)
+SELECTED_NODE_COLOR = QColor(0, 255, 0)
 VECTOR_HANDLE_SIZE = 8.0
 BASIS_VECTOR_WIDTH = 2.0
-EXTENDED_PATCH_NODE_SIZE = 6.0
 EXTENDED_BEZIER_HANDLE_SIZE = 9.0
 EXTENDED_PATCH_LINE_WIDTH = 1.75
 GRAPHICS_HANDLE_OUTLINE_WIDTH = 1.0
@@ -41,11 +42,14 @@ BOUNDARY_EDGE_WIDTH = 2
 BOUNDARY_EDGE_COLOR = QColor(0, 255, 255)
 STATIC_MESH_WIDTH = 0.75
 Z_STATIC_MESH = -1.0
+Z_WALL_OUTLINE = -0.25
 Z_MESH_EDGE = 0.0
 Z_BOUNDARY_EDGE = 0.5
 Z_PATCH_PREVIEW = 1.0
 Z_NODE = 2.0
 Z_VECTOR_HANDLE = 4.0
+WALL_OUTLINE_COLOR = QColor(128, 0, 128)
+WALL_OUTLINE_WIDTH = 2.0
 
 this_scaling = 100.0
 node_list = []
@@ -88,6 +92,74 @@ def graphics_handle_outline_pen():
     pen.setWidthF(GRAPHICS_HANDLE_OUTLINE_WIDTH)
     pen.setCosmetic(True)
     return pen
+
+
+def parse_wall_outline(filename):
+    """Read ordered physical R/Z; columns after the first two are ignored."""
+    points = []
+    header_skipped = False
+    with open(filename, "r") as wall_file:
+        for line_number, raw_line in enumerate(wall_file, 1):
+            line = raw_line.strip()
+            if not line or line.startswith(("#", "!")):
+                continue
+            columns = line.split()
+            try:
+                if len(columns) < 2:
+                    raise ValueError
+                r_value = float(columns[0])
+                z_value = float(columns[1])
+            except ValueError:
+                if not points and not header_skipped and len(columns) >= 2:
+                    try:
+                        float(columns[0])
+                        first_is_numeric = True
+                    except ValueError:
+                        first_is_numeric = False
+                    try:
+                        float(columns[1])
+                        second_is_numeric = True
+                    except ValueError:
+                        second_is_numeric = False
+                    if not first_is_numeric and not second_is_numeric:
+                        header_skipped = True
+                        continue
+                raise ValueError(
+                    "Invalid wall coordinates on line {}: expected at least "
+                    "two numeric columns".format(line_number)
+                )
+            if not math.isfinite(r_value) or not math.isfinite(z_value):
+                raise ValueError(
+                    "Invalid wall coordinates on line {}: R and Z must be "
+                    "finite".format(line_number)
+                )
+            points.append((r_value, z_value))
+    if len(points) < 2:
+        raise ValueError("Wall outline must contain at least two valid points")
+    return points
+
+
+class wall_outline_item(QGraphicsPathItem):
+    """Lightweight, noninteractive ordered wall-reference polyline."""
+    def __init__(self, physical_points, scaling=None):
+        if scaling is None:
+            scaling = this_scaling
+        path = QPainterPath()
+        first_r, first_z = physical_points[0]
+        path.moveTo(scaling * first_r, scaling * first_z)
+        for r_value, z_value in physical_points[1:]:
+            path.lineTo(scaling * r_value, scaling * z_value)
+        super().__init__(path)
+        pen = QPen(WALL_OUTLINE_COLOR)
+        pen.setWidthF(WALL_OUTLINE_WIDTH)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setBrush(Qt.NoBrush)
+        self.setZValue(Z_WALL_OUTLINE)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        self.setFlag(QGraphicsItem.ItemIsMovable, False)
+        self.setAcceptHoverEvents(False)
+        self.setAcceptedMouseButtons(Qt.NoButton)
 
 
 def graphics_item_in_scene(item, expected_scene):
@@ -994,6 +1066,61 @@ def effective_node_basis_vector(node, basis_index, owner_edge=None):
     return np.asarray(node_basis_display_vector(node, basis_index), dtype=float)
 
 
+def cap_continuation_basis_vector(
+    cap_node, new_neighbor, basis_index, owner_edge, direction_sign=1.0,
+    continuation_direction=None,
+):
+    """Scale an old cap tangent to the adjacent new-patch chord length."""
+    vector = effective_node_basis_vector(cap_node, basis_index, owner_edge)
+    new_neighbor_position = (
+        new_neighbor.position
+        if hasattr(new_neighbor, "position") else new_neighbor
+    )
+    new_chord = np_point(new_neighbor_position) - np_point(cap_node.position)
+    new_length = np.linalg.norm(new_chord)
+    if new_length == 0.0:
+        return vector
+    direction = (
+        direction_sign * new_chord
+        if continuation_direction is None
+        else np.asarray(continuation_direction, dtype=float)
+    )
+    if np.inner(vector, direction) < 0.0:
+        vector = -vector
+
+    owner = element_by_index(getattr(owner_edge, "element_index", None))
+    if owner is None:
+        return vector
+    local_vertices = [
+        local_vertex
+        for local_vertex, vertex in enumerate(owner.vertices)
+        if vertex == cap_node.index
+    ]
+    if len(local_vertices) != 1:
+        return vector
+    local_vertex = local_vertices[0]
+    candidate_sides = {(local_vertex - 1) % 4, local_vertex}
+    cap_side = getattr(owner_edge, "element_side", None)
+    main_sides = candidate_sides - {cap_side}
+    if len(main_sides) != 1:
+        return vector
+    side = main_sides.pop()
+    other_local_vertex = (
+        side if (side + 1) % 4 == local_vertex
+        else (local_vertex + 1) % 4
+    )
+    old_node_index = int(owner.vertices[other_local_vertex])
+    if not 0 <= old_node_index < len(node_list):
+        return vector
+    old_node = node_list[old_node_index]
+    old_length = np.linalg.norm(
+        np_point(cap_node.position) - np_point(old_node.position)
+    )
+    if old_length == 0.0:
+        return vector
+    return (new_length / old_length) * vector
+
+
 def boundary_chain_outward_displacement(ordered_edges):
     outward_normals = []
     transverse_lengths = []
@@ -1182,22 +1309,19 @@ class extended_patch(QGraphicsPathItem):
         if fixed_start is not None and hasattr(fixed_start, "xx"):
             topology = self.one_cap_topology or self.capped_gap
             owner_edges = getattr(topology, "start_cap_edges", []) or []
-            vector = effective_node_basis_vector(
-                fixed_start, main_uv_index,
+            vector = cap_continuation_basis_vector(
+                fixed_start, self.outer_nodes[1], main_uv_index,
                 owner_edges[-1] if owner_edges else None,
             )
-            if np.inner(vector, vectors[0]) < 0.0:
-                vector = -vector
             vectors[0] = vector
         if fixed_end is not None and hasattr(fixed_end, "xx"):
             topology = self.one_cap_topology or self.capped_gap
             owner_edges = getattr(topology, "end_cap_edges", []) or []
-            vector = effective_node_basis_vector(
-                fixed_end, main_uv_index,
+            vector = cap_continuation_basis_vector(
+                fixed_end, self.outer_nodes[-2], main_uv_index,
                 owner_edges[-1] if owner_edges else None,
+                direction_sign=-1.0,
             )
-            if np.inner(vector, vectors[-1]) < 0.0:
-                vector = -vector
             vectors[-1] = vector
         return vectors
 
@@ -1252,30 +1376,26 @@ class extended_patch(QGraphicsPathItem):
                 )
             ]
             if topology is not None:
-                positional_row_vectors = self.positional_along_vectors(
-                    self.preview_node_rows[radial_index]
-                )
                 if (
                     getattr(topology, "start_cap_nodes", [])
                     and hasattr(topology.start_cap_nodes[radial_index], "xx")
                 ):
-                    vector = effective_node_basis_vector(
-                        topology.start_cap_nodes[radial_index], main_uv_index,
+                    vector = cap_continuation_basis_vector(
+                        topology.start_cap_nodes[radial_index],
+                        self.preview_node_rows[radial_index][1], main_uv_index,
                         topology.start_cap_edges[radial_index - 1],
                     )
-                    if np.inner(vector, positional_row_vectors[0]) < 0.0:
-                        vector = -vector
                     row_vectors[0] = vector
                 if (
                     getattr(topology, "end_cap_nodes", [])
                     and hasattr(topology.end_cap_nodes[radial_index], "xx")
                 ):
-                    vector = effective_node_basis_vector(
-                        topology.end_cap_nodes[radial_index], main_uv_index,
+                    vector = cap_continuation_basis_vector(
+                        topology.end_cap_nodes[radial_index],
+                        self.preview_node_rows[radial_index][-2], main_uv_index,
                         topology.end_cap_edges[radial_index - 1],
+                        direction_sign=-1.0,
                     )
-                    if np.inner(vector, positional_row_vectors[-1]) < 0.0:
-                        vector = -vector
                     row_vectors[-1] = vector
             vector_rows.append(row_vectors)
         vector_rows.append(outer_vectors)
@@ -1528,12 +1648,18 @@ class extended_patch(QGraphicsPathItem):
         if fixed_node is not None:
             topology = self.one_cap_topology or self.capped_gap
             owner_edges = getattr(topology, "start_cap_edges", []) or []
-            vector = effective_node_basis_vector(
-                fixed_node, self.main_uv_index(),
-                owner_edges[-1] if owner_edges else None,
+            new_neighbor = (
+                self.outer_nodes[1]
+                if len(self.outer_nodes) == self.required_outer_node_count
+                else qt_point(
+                    start + (end - start) / len(self.ordered_edges)
+                )
             )
-            if np.inner(vector, end - start) < 0:
-                vector = -vector
+            vector = cap_continuation_basis_vector(
+                fixed_node, new_neighbor, self.main_uv_index(),
+                owner_edges[-1] if owner_edges else None,
+                continuation_direction=end - start,
+            )
             return vector
         tangent_position = next(
             handle.pos() for handle in self.bezier_handles
@@ -1548,12 +1674,19 @@ class extended_patch(QGraphicsPathItem):
         if fixed_node is not None:
             topology = self.one_cap_topology or self.capped_gap
             owner_edges = getattr(topology, "end_cap_edges", []) or []
-            vector = effective_node_basis_vector(
-                fixed_node, self.main_uv_index(),
-                owner_edges[-1] if owner_edges else None,
+            new_neighbor = (
+                self.outer_nodes[-2]
+                if len(self.outer_nodes) == self.required_outer_node_count
+                else qt_point(
+                    end - (end - start) / len(self.ordered_edges)
+                )
             )
-            if np.inner(vector, start - end) < 0:
-                vector = -vector
+            vector = cap_continuation_basis_vector(
+                fixed_node, new_neighbor, self.main_uv_index(),
+                owner_edges[-1] if owner_edges else None,
+                direction_sign=-1.0,
+                continuation_direction=start - end,
+            )
             return vector
         tangent_position = next(
             handle.pos() for handle in self.bezier_handles
@@ -1662,44 +1795,6 @@ class extended_patch(QGraphicsPathItem):
     def paint(self, painter: QPainter, option, widget=None):
         painter.setPen(self.pen())
         painter.drawPath(self.path())
-        zoom_level = 1.0
-        if self.scene() and self.scene().views():
-            zoom_level = self.scene().views()[0].zoom_level
-        preview_node_size = EXTENDED_PATCH_NODE_SIZE / zoom_level
-        preview_node_radius = preview_node_size / 2.0
-        fixed_nodes = [
-            node for node in (
-                self.fixed_bezier_start_node(), self.fixed_bezier_end_node()
-            ) if node is not None
-        ]
-        for node in self.outer_nodes:
-            if any(node is fixed_node for fixed_node in fixed_nodes):
-                continue
-            painter.drawEllipse(
-                node.position.x() - preview_node_radius,
-                node.position.y() - preview_node_radius,
-                preview_node_size,
-                preview_node_size,
-            )
-        for row in self.preview_node_rows[1:-1]:
-            for node in row:
-                painter.drawEllipse(
-                    node.position.x() - preview_node_radius,
-                    node.position.y() - preview_node_radius,
-                    preview_node_size,
-                    preview_node_size,
-                )
-        if self.one_cap_topology is not None and not self.outer_nodes:
-            fixed_node = (
-                self.one_cap_topology.outer_start_node
-                or self.one_cap_topology.outer_end_node
-            )
-            painter.drawEllipse(
-                fixed_node.position.x() - preview_node_radius,
-                fixed_node.position.y() - preview_node_radius,
-                preview_node_size,
-                preview_node_size,
-            )
 
 
 class this_view(QGraphicsView):
@@ -1709,6 +1804,8 @@ class this_view(QGraphicsView):
         self.start_point = None
         self.end_point   = None
         self.rubberband_mode = None
+        self.right_pan_active = False
+        self.right_pan_last_pos = None
         self.zoom_level  = 1.0
         self.auto_fit_on_resize = True
         self._view_adjustment_in_progress = False
@@ -1716,7 +1813,7 @@ class this_view(QGraphicsView):
         self.dragged_node = None
         self.pending_main_uv_index = None
         self.pending_radial_layers = 1
-        self.pending_bezier_mode = False
+        self.pending_bezier_mode = True
         self.editable_depth = 0
         self._element_adjacency = None
         self.editable_element_indices_set = set()
@@ -1724,6 +1821,9 @@ class this_view(QGraphicsView):
         self.patch_controls = None
         self.document_modified = False
         self.document_window = None
+        self.wall_outline_points = []
+        self.wall_outline_filename = None
+        self.wall_outline_item = None
         self.last_geometry_undo = None
         self._geometry_drag_snapshot = None
         self.current_patch = None
@@ -1731,9 +1831,22 @@ class this_view(QGraphicsView):
         self.selected_edges = []
         self.selected_nodes = []
         self.selected_elements = []
+        self._view_adjustment_in_progress = True
+        try:
+            self.apply_view_scale(self.zoom_level)
+        finally:
+            self._view_adjustment_in_progress = False
+
+    def apply_view_scale(self, zoom_level=None):
+        """Apply zoom while displaying physical R right and physical Z up."""
+        if zoom_level is not None:
+            self.zoom_level = float(zoom_level)
+        self.setTransform(
+            QTransform().scale(self.zoom_level, -self.zoom_level)
+        )
 
     def grid_bounding_rect(self):
-        """Return scene bounds for active mesh geometry, excluding previews."""
+        """Return persistent mesh and wall bounds, excluding previews."""
         grid_rect = None
         background = globals().get("static_mesh")
         if graphics_item_in_scene(background, self.scene()):
@@ -1769,7 +1882,25 @@ class this_view(QGraphicsView):
                 if grid_rect is None
                 else grid_rect.united(node_rect)
             )
+        wall_item = self.wall_outline_item
+        if graphics_item_in_scene(wall_item, self.scene()):
+            wall_rect = wall_item.mapRectToScene(wall_item.boundingRect())
+            grid_rect = (
+                QRectF(wall_rect)
+                if grid_rect is None
+                else grid_rect.united(wall_rect)
+            )
         return grid_rect
+
+    def rebuild_wall_outline_item(self):
+        """Recreate the stored wall reference in the current scene."""
+        self.wall_outline_item = None
+        if self.scene() is None or not self.wall_outline_points:
+            return None
+        item = wall_outline_item(self.wall_outline_points, this_scaling)
+        self.scene().addItem(item)
+        self.wall_outline_item = item
+        return item
 
     def fit_grid_to_window(self):
         self.auto_fit_on_resize = True
@@ -1787,6 +1918,7 @@ class this_view(QGraphicsView):
         )
         self._view_adjustment_in_progress = True
         try:
+            self.apply_view_scale(1.0)
             self.fitInView(fit_rect, Qt.KeepAspectRatio)
             transform = self.transform()
             self.zoom_level = math.hypot(transform.m11(), transform.m12())
@@ -1824,7 +1956,6 @@ class this_view(QGraphicsView):
             self.scene().removeItem(self.current_extended_patch)
         self.current_extended_patch = None
         self.pending_main_uv_index = None
-        self.pending_bezier_mode = False
         self.update_patch_controls()
 
     def set_edge_selected(self, edge, selected):
@@ -1839,8 +1970,7 @@ class this_view(QGraphicsView):
             element.path_item.setBrush(QBrush(QColor(255, 255, 255, 64)))
             element.update()
         for node in self.selected_nodes:
-            color = QColor(0, 0, 255) if node.boundary else QColor(255, 0, 0)
-            node.ellipse_item.setBrush(QBrush(color))
+            node.ellipse_item.setBrush(QBrush(NODE_COLOR))
             node.update()
 
         self.selected_nodes = []
@@ -1862,7 +1992,7 @@ class this_view(QGraphicsView):
                 self.selected_elements.append(element)
 
         for node in self.selected_nodes:
-            node.ellipse_item.setBrush(QBrush(QColor(0, 255, 0)))
+            node.ellipse_item.setBrush(QBrush(SELECTED_NODE_COLOR))
             node.update()
         for element in self.selected_elements:
             element.path_item.setBrush(QBrush(QColor(50, 50, 50, 64)))
@@ -2028,6 +2158,23 @@ class this_view(QGraphicsView):
         if self.patch_controls is not None:
             self.patch_controls.update_from_view()
 
+    def update_manual_outer_node_status(self):
+        patch = self.current_extended_patch
+        if patch is None or patch.bezier_mode:
+            return
+        defined_count = len(patch.outer_nodes)
+        required_count = patch.required_outer_node_count
+        if defined_count == required_count:
+            self.set_patch_status("Straight patch ready")
+        elif patch.one_cap_topology is not None:
+            self.set_patch_status("Ctrl-click free outer endpoint")
+        else:
+            self.set_patch_status(
+                "Add outer nodes with Ctrl-click ({}/{})".format(
+                    defined_count, required_count
+                )
+            )
+
     def set_pending_main_uv_index(self, value):
         if value not in (None, 1, 2):
             raise ValueError("Extended-patch main direction must be Auto, 1, or 2")
@@ -2094,6 +2241,9 @@ class this_view(QGraphicsView):
             self.set_patch_status("Start an extended patch first")
             self.update_patch_controls()
             return False
+        if self.current_extended_patch.bezier_mode:
+            self.update_patch_controls()
+            return False
         self.current_extended_patch.enable_bezier_mode()
         self.pending_bezier_mode = True
         self.set_patch_status("Bézier enabled")
@@ -2110,7 +2260,7 @@ class this_view(QGraphicsView):
                     active_view=self, topology_changed=True
                 )
                 self.pending_main_uv_index = None
-                self.pending_bezier_mode = False
+                self.pending_bezier_mode = True
                 self.set_patch_status("Patch committed")
                 self.mark_document_modified()
             self.update_patch_controls()
@@ -2122,16 +2272,22 @@ class this_view(QGraphicsView):
             return False
         add_patch_to_nodes_elements(self.current_patch)
         rebuild_graphics_layers(active_view=self, topology_changed=True)
+        self.pending_bezier_mode = True
         self.mark_document_modified()
         self.update_patch_controls()
         return True
 
     def cancel_current_operation(self):
         self.clear_selection()
+        self.pending_bezier_mode = True
         self.set_patch_status("Ready")
         self.update_patch_controls()
 
     def create_extended_patch_preview(self):
+        if self.current_extended_patch is not None:
+            self.set_patch_status("Patch preview already exists")
+            self.update_patch_controls()
+            return False
         boundary_topology = None
         ambiguous_topology = False
         for edge in self.selected_edges:
@@ -2243,12 +2399,11 @@ class this_view(QGraphicsView):
                 or boundary_topology.end_cap_edges
             )
             self.current_extended_patch.radial_layers = len(cap_edges)
-            self.current_extended_patch.initialize_automatic_outer_geometry()
+            self.current_extended_patch.redraw()
         else:
             self.current_extended_patch.set_radial_layers(
                 self.pending_radial_layers
             )
-            self.current_extended_patch.initialize_automatic_outer_geometry()
         self.scene().addItem(self.current_extended_patch)
         self.pending_main_uv_index = None
         print(
@@ -2259,10 +2414,11 @@ class this_view(QGraphicsView):
             "extended patch ordered edge vertex pairs:",
             [list(edge.vertices) for edge in ordered_edges],
         )
-        self.set_patch_status("Preview created")
         if self.pending_bezier_mode:
             self.enable_current_patch_bezier()
+            self.set_patch_status("Bézier preview created")
         else:
+            self.update_manual_outer_node_status()
             self.update_patch_controls()
         return True
 
@@ -2300,11 +2456,10 @@ class this_view(QGraphicsView):
         if event.key() == Qt.Key_Escape:
             self.cancel_current_operation()
             return
-        if event.key() == 85:    #   u
+        if event.key() == Qt.Key_U:
             print("resetting zoom_level to 1")
             self.auto_fit_on_resize = False
-            self.zoom_level = 1. 
-            self.setTransform(QTransform().scale(self.zoom_level, self.zoom_level))
+            self.apply_view_scale(1.0)
         if event.key() == 80:    #   p
             self.commit_current_patch()
             return
@@ -2324,6 +2479,14 @@ class this_view(QGraphicsView):
 
     def mousePressEvent(self, event):        
 
+        if hasattr(event, "button") and event.button() == Qt.RightButton:
+            self.right_pan_active = True
+            self.right_pan_last_pos = event.pos()
+            self.auto_fit_on_resize = False
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+
         modifiers = (
             event.modifiers()
             if hasattr(event, "modifiers")
@@ -2335,6 +2498,7 @@ class this_view(QGraphicsView):
                     self.mapToScene(event.pos())
                 ):
                     print("All extended-patch outer points have been defined")
+                self.update_manual_outer_node_status()
                 self.update_patch_controls()
                 return
             if len(self.selected_edges) == 3:
@@ -2415,6 +2579,18 @@ class this_view(QGraphicsView):
             self.rubberBand.show()
 
     def mouseMoveEvent(self, event):
+        if self.right_pan_active:
+            position = event.pos()
+            delta = position - self.right_pan_last_pos
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x()
+            )
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y()
+            )
+            self.right_pan_last_pos = position
+            event.accept()
+            return
         if self.selected_point:
             self.selected_point.move_to_scene(self.mapToScene(event.pos()))
             event.accept()
@@ -2424,11 +2600,23 @@ class this_view(QGraphicsView):
             event.accept()
             return
         if self.rubberBand and self.start_point: 
-           self.rubberBand.setGeometry(QRect(self.start_point, event.pos()))
+           self.rubberBand.setGeometry(
+               QRect(self.start_point, event.pos()).normalized()
+           )
            self.end_point = event.pos()
            return
 
     def mouseReleaseEvent(self, event):
+        if (
+            self.right_pan_active
+            and hasattr(event, "button")
+            and event.button() == Qt.RightButton
+        ):
+            self.right_pan_active = False
+            self.right_pan_last_pos = None
+            self.viewport().unsetCursor()
+            event.accept()
+            return
         if self.selected_point:
             if isinstance(self.selected_point, basis_vector_handle):
                 self.complete_geometry_drag()
@@ -2475,7 +2663,7 @@ class this_view(QGraphicsView):
                 self.zoom_level *= zoom_factor
  
                 self.centerOn(self.mapToScene(zoom_rect.center()))
-                self.setTransform(QTransform().scale(self.zoom_level, self.zoom_level))
+                self.apply_view_scale(self.zoom_level)
         self.finish_rubber_band()
 
 
@@ -2526,13 +2714,16 @@ class extended_patch_controls(QGroupBox):
         layout.addWidget(self.outer_boundary_combo)
 
         self.preview_button = QPushButton("Create / Preview")
-        self.bezier_button = QPushButton("Enable Bézier")
         self.commit_button = QPushButton("Commit")
         self.cancel_button = QPushButton("Cancel")
         self.fit_button = QPushButton("Fit to window")
+        self.load_wall_button = QPushButton("Load wall outline")
+        self.wall_label = QLabel("Wall: none")
+        self.wall_label.setWordWrap(True)
         layout.addWidget(self.fit_button)
+        layout.addWidget(self.load_wall_button)
+        layout.addWidget(self.wall_label)
         layout.addWidget(self.preview_button)
-        layout.addWidget(self.bezier_button)
         button_row = QHBoxLayout()
         button_row.addWidget(self.commit_button)
         button_row.addWidget(self.cancel_button)
@@ -2556,10 +2747,10 @@ class extended_patch_controls(QGroupBox):
             self._outer_boundary_changed
         )
         self.preview_button.clicked.connect(self._create_preview)
-        self.bezier_button.clicked.connect(self._enable_bezier)
         self.commit_button.clicked.connect(self._commit)
         self.cancel_button.clicked.connect(self._cancel)
         self.fit_button.clicked.connect(self._fit_to_window)
+        self.load_wall_button.clicked.connect(self._load_wall_outline)
         if view is not None:
             self.attach_view(view)
         else:
@@ -2663,10 +2854,15 @@ class extended_patch_controls(QGroupBox):
             )
             self.outer_boundary_combo.setEnabled(patch is None)
             self.preview_button.setEnabled(patch is None)
-            self.bezier_button.setEnabled(
-                patch is not None and not bezier_active
+            self.commit_button.setEnabled(
+                patch is not None
+                and getattr(patch, "can_commit", True)
+                and (
+                    not hasattr(patch, "outer_nodes")
+                    or len(patch.outer_nodes)
+                    == patch.required_outer_node_count
+                )
             )
-            self.commit_button.setEnabled(patch is not None)
         finally:
             self._updating = False
 
@@ -2694,10 +2890,6 @@ class extended_patch_controls(QGroupBox):
         if self.view is not None:
             self.view.create_extended_patch_preview()
 
-    def _enable_bezier(self):
-        if self.view is not None:
-            self.view.enable_current_patch_bezier()
-
     def _commit(self):
         if self.view is not None:
             self.view.commit_current_patch()
@@ -2709,6 +2901,21 @@ class extended_patch_controls(QGroupBox):
     def _fit_to_window(self):
         if self.view is not None:
             self.view.fit_grid_to_window()
+
+    def _load_wall_outline(self):
+        if self.view is not None and self.view.document_window is not None:
+            self.view.document_window.load_wall_outline_dialog()
+
+    def update_wall_label(self):
+        if self.view is None or not self.view.wall_outline_points:
+            self.wall_label.setText("Wall: none")
+            return
+        self.wall_label.setText(
+            "Wall: {}\n{} points".format(
+                os.path.basename(self.view.wall_outline_filename),
+                len(self.view.wall_outline_points),
+            )
+        )
 
 
 class grid_editor_window(QMainWindow):
@@ -2763,6 +2970,46 @@ class grid_editor_window(QMainWindow):
         if interactive:
             QMessageBox.critical(self, title, message)
 
+    def install_wall_outline(self, points, filename):
+        """Atomically replace the wall overlay without modifying grid state."""
+        if self.current_filename is None or self.view.scene() is None:
+            raise ValueError("Open a grid before loading the wall outline")
+        new_item = wall_outline_item(points, this_scaling)
+        current_scene = self.view.scene()
+        current_scene.addItem(new_item)
+        old_item = self.view.wall_outline_item
+        if graphics_item_in_scene(old_item, current_scene):
+            current_scene.removeItem(old_item)
+        self.view.wall_outline_points = list(points)
+        self.view.wall_outline_filename = os.path.abspath(filename)
+        self.view.wall_outline_item = new_item
+        self.patch_controls.update_wall_label()
+        message = "Wall loaded: {} points".format(len(points))
+        self.view.set_patch_status(message)
+        self.view.fit_grid_to_window()
+        return True
+
+    def load_wall_outline_file(self, filename, interactive=False):
+        try:
+            if self.current_filename is None or self.view.scene() is None:
+                raise ValueError("Open a grid before loading the wall outline")
+            points = parse_wall_outline(filename)
+            return self.install_wall_outline(points, filename)
+        except (OSError, ValueError) as error:
+            self._report_file_error(
+                "Could not load wall outline", error, interactive
+            )
+            return False
+
+    def load_wall_outline_dialog(self):
+        filename, unused_filter = QFileDialog.getOpenFileName(
+            self, "Load wall outline", "",
+            "Text files (*.txt *.dat);;All files (*)",
+        )
+        return bool(filename) and self.load_wall_outline_file(
+            filename, interactive=True
+        )
+
     def open_grid_file(self, filename, interactive=False):
         global jorek, scene, view, node_list, element_list, boundary_list
         global _diagnostic_nodes_xx_before
@@ -2802,6 +3049,7 @@ class grid_editor_window(QMainWindow):
         element_list = new_elements
         boundary_list = new_boundaries
         self.view.setScene(scene)
+        self.view.rebuild_wall_outline_item()
         self.view.clear_geometry_undo()
         self.view._element_adjacency = getattr(
             scene, "_element_adjacency", None
@@ -2830,11 +3078,12 @@ class grid_editor_window(QMainWindow):
         self.view.current_extended_patch = None
         self.view.pending_main_uv_index = None
         self.view.pending_radial_layers = 1
-        self.view.pending_bezier_mode = False
+        self.view.pending_bezier_mode = True
         self.current_filename = os.path.abspath(filename)
         self.source_is_grid_only = new_grid.grid_only_source
         self.view.document_modified = False
         self.view.set_patch_status("Grid opened")
+        self.patch_controls.update_wall_label()
         self.view.update_patch_controls()
         self.view.fit_grid_to_window()
         report_memory("after fit")
@@ -3194,6 +3443,7 @@ def basis_size_for_effective_vector(stored_basis, effective_vector):
 def override_fixed_bezier_endpoint_sizes(
     edge_sizes, edge_nodes, parameter_start_node, parameter_end_node,
     parameter_interval, start_tangent, end_tangent, uv_index, fixed_nodes,
+    fixed_effective_vectors=None,
 ):
     """Use each fixed node's actual stored basis for its endpoint multiplier."""
     intended_by_node = {
@@ -3206,9 +3456,25 @@ def override_fixed_bezier_endpoint_sizes(
         endpoint = next(
             index for index, node in enumerate(edge_nodes) if node is fixed_node
         )
-        edge_sizes[1, endpoint] = basis_size_for_effective_vector(
-            fixed_node.xx[:, uv_index], intended_by_node[fixed_node]
+        intended_vector = (fixed_effective_vectors or {}).get(
+            fixed_node.index, intended_by_node[fixed_node]
         )
+        edge_sizes[1, endpoint] = basis_size_for_effective_vector(
+            fixed_node.xx[:, uv_index], intended_vector
+        )
+    return edge_sizes
+
+
+def override_fixed_endpoint_sizes(
+    edge_sizes, edge_nodes, uv_index, fixed_effective_vectors,
+):
+    """Encode prescribed effective vectors through existing raw nodal bases."""
+    for endpoint, node in enumerate(edge_nodes):
+        effective_vector = (fixed_effective_vectors or {}).get(node.index)
+        if effective_vector is not None:
+            edge_sizes[1, endpoint] = basis_size_for_effective_vector(
+                node.xx[:, uv_index], effective_vector
+            )
     return edge_sizes
 
 
@@ -3274,6 +3540,7 @@ class single_element_patch_data:
         along_edge_index=None, along_parameters=None, fixed_bezier_nodes=None,
         parameter_start_node=None, parameter_end_node=None,
         along_basis_vectors=None, along_basis_vector=None,
+        fixed_bezier_effective_vectors=None,
     ):
         self.edges = list(edges)
         self.corner_nodes = list(corner_nodes)
@@ -3290,6 +3557,7 @@ class single_element_patch_data:
         self.parameter_end_node = parameter_end_node
         self.along_basis_vectors = along_basis_vectors
         self.along_basis_vector = along_basis_vector
+        self.fixed_bezier_effective_vectors = fixed_bezier_effective_vectors
 
 
 def preview_node(point_or_node):
@@ -3323,6 +3591,7 @@ def add_element_from_two_edges(
     along_tangent=None, along_tangents=None, along_parameter_interval=None,
     along_edge_index=None, along_parameters=None, fixed_bezier_nodes=None,
     along_basis_vector=None,
+    fixed_bezier_effective_vectors=None,
 ):
     patch = single_element_patch_data(
         [edge0, edge1], [preview_node(point)],
@@ -3335,6 +3604,7 @@ def add_element_from_two_edges(
         along_parameters=along_parameters,
         fixed_bezier_nodes=fixed_bezier_nodes,
         along_basis_vector=along_basis_vector,
+        fixed_bezier_effective_vectors=fixed_bezier_effective_vectors,
     )
     element_count = len(element_list)
     _add_single_element_patch_to_nodes_elements(patch)
@@ -3345,6 +3615,7 @@ def add_element_from_three_edges(
     edge0, edge1, edge2, along_tangents=None, along_parameters=None,
     along_edge_index=None, parameter_start_node=None,
     parameter_end_node=None, fixed_bezier_nodes=None,
+    fixed_bezier_effective_vectors=None,
 ):
     along_parameter_interval = (
         along_parameters[along_edge_index + 1]
@@ -3360,6 +3631,7 @@ def add_element_from_three_edges(
         fixed_bezier_nodes=fixed_bezier_nodes,
         parameter_start_node=parameter_start_node,
         parameter_end_node=parameter_end_node,
+        fixed_bezier_effective_vectors=fixed_bezier_effective_vectors,
     )
     element_count = len(element_list)
     _add_single_element_patch_to_nodes_elements(patch)
@@ -3650,6 +3922,11 @@ def add_two_cap_extended_row(
                 "parameter_end_node": fixed_end_node,
                 "fixed_bezier_nodes": [fixed_start_node, fixed_end_node],
             }
+        if along_basis_vectors is not None:
+            bezier_kwargs["fixed_bezier_effective_vectors"] = {
+                fixed_start_node.index: along_basis_vectors[0],
+                fixed_end_node.index: -np.asarray(along_basis_vectors[-1]),
+            }
         if add_element_from_three_edges(
             inner_edges[0], start_cap_edge, end_cap_edge,
             **bezier_kwargs
@@ -3684,6 +3961,10 @@ def add_two_cap_extended_row(
                         [fixed_start_node] if column == 0 else None
                     ),
                 })
+            if along_basis_vectors is not None and column == 0:
+                bezier_kwargs["fixed_bezier_effective_vectors"] = {
+                    fixed_start_node.index: along_basis_vectors[0]
+                }
             if add_element_from_two_edges(
                 inner_edges[column], transverse_edge,
                 target_positions[column + 1],
@@ -3716,6 +3997,10 @@ def add_two_cap_extended_row(
                 "parameter_start_node": next_nodes[-1],
                 "parameter_end_node": fixed_end_node,
                 "fixed_bezier_nodes": [fixed_end_node],
+            }
+        if along_basis_vectors is not None:
+            bezier_kwargs["fixed_bezier_effective_vectors"] = {
+                fixed_end_node.index: -np.asarray(along_basis_vectors[-1])
             }
         if add_element_from_three_edges(
             inner_edges[-1], transverse_edge, end_cap_edge,
@@ -3890,7 +4175,7 @@ def cap_first_bezier_data(patch, topology):
 def add_one_cap_extended_row(
     inner_nodes, inner_edges, target_positions, cap_edge, fixed_outer_node,
     reference_inner_nodes=None, along_tangents=None, along_parameters=None,
-    along_basis_vectors=None,
+    along_basis_vectors=None, fixed_cap_effective_vector=None,
 ):
     """Create one cap-first radial row without duplicating its fixed node."""
     if len(inner_nodes) != len(inner_edges) + 1:
@@ -3958,6 +4243,11 @@ def add_one_cap_extended_row(
             along_basis_vector=(
                 along_basis_vectors[index + 1]
                 if along_basis_vectors is not None else None
+            ),
+            fixed_bezier_effective_vectors=(
+                {fixed_outer_node.index: fixed_cap_effective_vector}
+                if fixed_cap_effective_vector is not None and index == 0
+                else None
             ),
         ) is None:
             return None
@@ -4097,6 +4387,12 @@ def add_one_cap_gap_to_nodes_elements(patch):
                 working_vector_rows[radial_index + 1]
                 if working_vector_rows is not None else None
             ),
+            fixed_cap_effective_vector=(
+                (
+                    1.0 if topology.start_cap_edges else -1.0
+                ) * np.asarray(working_vector_rows[radial_index + 1][0])
+                if working_vector_rows is not None else None
+            ),
         )
         if row_result is None:
             return
@@ -4156,9 +4452,14 @@ def _add_single_element_patch_to_nodes_elements(patch):
                 patch.along_tangents[index],
                 patch.along_tangents[index + 1],
                 edge_uv_index, patch.fixed_bezier_nodes,
+                patch.fixed_bezier_effective_vectors,
             )
         else:
             edge_sizes = signed_edge_sizes(edge_nodes, edge_uv_index)
+            edge_sizes = override_fixed_endpoint_sizes(
+                edge_sizes, edge_nodes, edge_uv_index,
+                patch.fixed_bezier_effective_vectors,
+            )
 
         missing_edge = boundary_edge(
             edge_nodes, edge_vertices, [], None, None,
@@ -4283,9 +4584,14 @@ def _add_single_element_patch_to_nodes_elements(patch):
                 patch.along_tangents[patch.along_edge_index],
                 patch.along_tangents[patch.along_edge_index + 1],
                 edge_uv_index, patch.fixed_bezier_nodes,
+                patch.fixed_bezier_effective_vectors,
             )
         else:
             edge_sizes = signed_edge_sizes(edge_nodes, edge_uv_index)
+            edge_sizes = override_fixed_endpoint_sizes(
+                edge_sizes, edge_nodes, edge_uv_index,
+                patch.fixed_bezier_effective_vectors,
+            )
     
         this_edge_3 = boundary_edge(edge_nodes, edge_vertices, [], None, None, edge_uv_index, edge_sizes)
         if patch.along_parameter_interval is not None:
@@ -5398,8 +5704,7 @@ class jorek_node_item(QGraphicsItem):
         self.ellipse_item.setFlag(QGraphicsItem.ItemIsSelectable)
 
         self.ellipse_item.setPen(QPen(Qt.black, 1.))
-        self.ellipse_item.setBrush(QBrush(QColor(255, 0, 0)))
-        if self.boundary :  self.ellipse_item.setBrush(QBrush(QColor(0, 0, 255)))
+        self.ellipse_item.setBrush(QBrush(NODE_COLOR))
 
         self.index = index
 

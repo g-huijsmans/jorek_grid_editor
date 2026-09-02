@@ -614,6 +614,41 @@ def test_ctrl_z_is_ignored_during_active_geometry_drag(monkeypatch):
     assert case.view.last_geometry_undo is not None
 
 
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        (QPoint(20, 30), QPoint(80, 90)),
+        (QPoint(80, 90), QPoint(20, 30)),
+        (QPoint(80, 30), QPoint(20, 90)),
+        (QPoint(20, 90), QPoint(80, 30)),
+    ],
+)
+def test_visible_rubber_band_is_normalized_in_every_drag_direction(
+    monkeypatch, start, end
+):
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    view.resize(320, 240)
+    view.setScene(QGraphicsScene())
+    monkeypatch.setattr(
+        grid_editor5.QApplication, "keyboardModifiers", lambda: Qt.NoModifier
+    )
+
+    def event(position):
+        return SimpleNamespace(pos=lambda: position, accept=lambda: None)
+
+    view.mousePressEvent(event(start))
+    view.mouseMoveEvent(event(end))
+
+    expected = QRect(start, end).normalized()
+    geometry = view.rubberBand.geometry()
+    assert geometry.width() >= 0
+    assert geometry.height() >= 0
+    assert geometry == expected
+    assert view.end_point == end
+    assert app is not None
+
+
 def test_rubber_band_and_item_query_share_viewport_coordinates(monkeypatch):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
@@ -2175,8 +2210,8 @@ def test_escape_clears_all_selections_and_current_patch():
     assert patch.scene() is None
     assert view.selected_nodes == []
     assert view.selected_elements == []
-    assert boundary_node_item.brush().color() == QColor(0, 0, 255)
-    assert interior_node_item.brush().color() == QColor(255, 0, 0)
+    assert boundary_node_item.brush().color() == grid_editor5.NODE_COLOR
+    assert interior_node_item.brush().color() == grid_editor5.NODE_COLOR
     assert element_path.brush().color() == QColor(255, 255, 255, 64)
     assert app is not None
 
@@ -2217,6 +2252,7 @@ def test_pending_direction_resolves_ambiguous_extended_patch(main_uv_index):
     scene = QGraphicsScene()
     view = this_view()
     view.setScene(scene)
+    view.set_pending_bezier_mode(False)
     selected_edges, edges_by_uv = ambiguous_two_plus_two_selection(scene)
     view.selected_edges = selected_edges
 
@@ -2261,6 +2297,7 @@ def test_e_starts_same_direction_extended_patch_and_escape_cancels(
     scene = QGraphicsScene()
     view = this_view()
     view.setScene(scene)
+    view.set_pending_bezier_mode(False)
     nodes = {
         index: SimpleNamespace(
             index=index, position=QPointF(float(index - 178), 0.0)
@@ -2331,6 +2368,7 @@ def test_e_previews_capped_boundary_gap():
     scene = QGraphicsScene()
     view = this_view()
     view.setScene(scene)
+    view.set_pending_bezier_mode(False)
     nodes = {
         index: SimpleNamespace(
             index=index, position=position,
@@ -2377,13 +2415,15 @@ def test_e_previews_capped_boundary_gap():
     assert app is not None
 
 
-def test_one_cap_e_initializes_automatic_extent_and_allows_manual_replacement(
+def test_one_cap_straight_e_waits_for_manual_free_endpoint(
     monkeypatch,
 ):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
     view = this_view()
     view.setScene(scene)
+    view.set_pending_bezier_mode(False)
+    controls = grid_editor5.extended_patch_controls(view)
     nodes = {
         index: SimpleNamespace(
             index=index, position=position,
@@ -2418,10 +2458,8 @@ def test_one_cap_e_initializes_automatic_extent_and_allows_manual_replacement(
     assert patch.can_commit is True
     assert patch.bezier_mode is False
     assert patch.one_cap_topology.outer_start_node is nodes[0]
-    assert [node.position for node in patch.outer_nodes] == [
-        QPointF(0.0, 2.0), QPointF(1.0, 2.0), QPointF(2.0, 2.0)
-    ]
-    assert patch.automatic_outer_geometry
+    assert patch.outer_nodes == []
+    assert not patch.automatic_outer_geometry
     assert patch.add_outer_node(QPointF(2.0, 2.0))
     assert [node.position for node in patch.outer_nodes] == [
         QPointF(0.0, 2.0), QPointF(1.0, 2.0), QPointF(2.0, 2.0)
@@ -2429,14 +2467,16 @@ def test_one_cap_e_initializes_automatic_extent_and_allows_manual_replacement(
     assert not patch.automatic_outer_geometry
     assert not patch.add_outer_node(QPointF(3.0, 2.0))
 
-    bezier_event = type("KeyEvent", (), {"key": lambda self: Qt.Key_B})()
-    view.keyPressEvent(bezier_event)
+    controls.update_from_view()
+    assert view.enable_current_patch_bezier()
 
     roles = {handle.role for handle in patch.bezier_handles}
     assert patch.outer_nodes[0] is nodes[0]
     assert roles == {"end", "end_tangent"}
     assert patch.bezier_start_position() == nodes[0].position
     assert np.allclose(patch.bezier_start_vector(), nodes[0].xx[:, 1])
+    assert controls.outer_boundary_combo.currentData() is True
+    assert not controls.outer_boundary_combo.isEnabled()
 
     assert app is not None
 
@@ -2739,7 +2779,7 @@ def test_extended_bezier_handles_use_fixed_screen_size_and_cosmetic_outline():
 
 
 @pytest.mark.parametrize("zoom_level", [0.1, 1.0, 10.0])
-def test_extended_patch_preview_graphics_use_screen_sized_dimensions(zoom_level):
+def test_extended_patch_paints_no_passive_node_markers(zoom_level):
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene()
     view = this_view()
@@ -2754,6 +2794,7 @@ def test_extended_patch_preview_graphics_use_screen_sized_dimensions(zoom_level)
         QPointF(0.0, 2.0), QPointF(1.0, 2.0), QPointF(2.0, 2.0)
     ])
     patch.set_radial_layers(2)
+    patch.enable_bezier_mode()
     scene.addItem(patch)
 
     class RecordingPainter:
@@ -2777,14 +2818,10 @@ def test_extended_patch_preview_graphics_use_screen_sized_dimensions(zoom_level)
     assert patch.pen().widthF() == pytest.approx(
         grid_editor5.EXTENDED_PATCH_LINE_WIDTH
     )
-    assert painter.ellipses
-    for unused_x, unused_y, width, height in painter.ellipses:
-        assert width * zoom_level == pytest.approx(
-            grid_editor5.EXTENDED_PATCH_NODE_SIZE
-        )
-        assert height * zoom_level == pytest.approx(
-            grid_editor5.EXTENDED_PATCH_NODE_SIZE
-        )
+    assert painter.ellipses == []
+    assert len(patch.outer_nodes) == 3
+    assert len(patch.preview_node_rows) == 3
+    assert patch.bezier_handles
     assert app is not None
 
 
@@ -3487,7 +3524,7 @@ def build_two_cap_selection(
     selected_edges = list(reversed(
         main_edges + start_cap_edges + end_cap_edges
     ))
-    install_edge_owner_lookup(monkeypatch, selected_edges)
+    owners = install_edge_owner_lookup(monkeypatch, selected_edges)
     monkeypatch.setattr(
         grid_editor5, "boundary_list", list(selected_edges), raising=False
     )
@@ -3499,10 +3536,12 @@ def build_two_cap_selection(
         start_nodes=[nodes[index] for index in start_indices],
         end_nodes=[nodes[index] for index in end_indices],
         main_uv_index=main_uv_index,
+        owners=owners,
     )
 
 
 def create_two_cap_patch(case):
+    case.view.set_pending_bezier_mode(False)
     case.view.keyPressEvent(
         type("KeyEvent", (), {
             "key": lambda self: Qt.Key_0 + case.main_uv_index
@@ -3709,23 +3748,19 @@ def test_extended_patch_panel_buttons_route_to_view_methods(monkeypatch):
         lambda: calls.append("preview"),
     )
     monkeypatch.setattr(
-        view, "enable_current_patch_bezier",
-        lambda: calls.append("bezier"),
-    )
-    monkeypatch.setattr(
         view, "commit_current_patch", lambda: calls.append("commit"),
     )
     monkeypatch.setattr(
         view, "cancel_current_operation", lambda: calls.append("cancel"),
     )
     for button in (
-        controls.preview_button, controls.bezier_button,
-        controls.commit_button, controls.cancel_button,
+        controls.preview_button, controls.commit_button,
+        controls.cancel_button,
     ):
         button.setEnabled(True)
         button.click()
 
-    assert calls == ["preview", "bezier", "commit", "cancel"]
+    assert calls == ["preview", "commit", "cancel"]
     assert app is not None
 
 
@@ -3776,6 +3811,7 @@ def test_keyboard_bezier_action_refreshes_attached_panel(monkeypatch):
     case = build_two_cap_selection(monkeypatch, 1, main_edge_count=2)
     controls = grid_editor5.extended_patch_controls(case.view)
     controls.main_direction_combo.setCurrentIndex(1)
+    controls.outer_boundary_combo.setCurrentIndex(0)
     controls.preview_button.click()
 
     assert case.view.current_extended_patch is not None
@@ -3787,7 +3823,6 @@ def test_keyboard_bezier_action_refreshes_attached_panel(monkeypatch):
     assert case.view.current_extended_patch.bezier_mode
     assert controls.outer_boundary_combo.currentData() is True
     assert not controls.outer_boundary_combo.isEnabled()
-    assert not controls.bezier_button.isEnabled()
     assert controls.status_message == "Bézier enabled"
     assert case.app is not None
 
@@ -3808,16 +3843,15 @@ def test_extended_patch_panel_two_cap_preview_and_cancel(monkeypatch):
     assert controls.main_direction_combo.currentData() == 1
     assert controls.radial_layers_spin.value() == 2
     assert not controls.radial_layers_spin.isEnabled()
-    assert not controls.bezier_button.isEnabled()
     assert controls.commit_button.isEnabled()
-    assert controls.status_message == "Bézier enabled"
+    assert controls.status_message == "Bézier preview created"
 
     controls.cancel_button.click()
     assert case.view.current_extended_patch is None
     assert case.view.selected_edges == []
     assert controls.main_direction_combo.isEnabled()
     assert controls.main_direction_combo.currentData() is None
-    assert controls.outer_boundary_combo.currentData() is False
+    assert controls.outer_boundary_combo.currentData() is True
     assert controls.status_message == "Ready"
     assert case.app is not None
 
@@ -4152,6 +4186,14 @@ def test_multi_layer_two_cap_bezier_commit_preserves_final_curve(
                 parameter_start_node: dt * tangents[index] / 3.0,
                 parameter_end_node: -dt * tangents[index + 1] / 3.0,
             }
+            if parameter_start_node is node_rows[row_index][0]:
+                intended_by_node[parameter_start_node] = (
+                    patch.preview_along_vectors[row_index][0]
+                )
+            if parameter_end_node is node_rows[row_index][-1]:
+                intended_by_node[parameter_end_node] = -np.asarray(
+                    patch.preview_along_vectors[row_index][-1]
+                )
             for endpoint, node in enumerate(edge.nodes):
                 assert np.allclose(
                     node.xx[:, main_uv_index] * edge.sizes[1, endpoint],
@@ -4167,19 +4209,22 @@ def test_multi_layer_two_cap_bezier_commit_preserves_final_curve(
                 controls = controls[:, ::-1]
             expected_controls = np.column_stack((
                 preview_positions[index],
-                preview_positions[index] + dt * tangents[index] / 3.0,
+                preview_positions[index]
+                + intended_by_node[parameter_start_node],
                 preview_positions[index + 1]
-                - dt * tangents[index + 1] / 3.0,
+                + intended_by_node[parameter_end_node],
                 preview_positions[index + 1],
             ))
             assert np.allclose(controls, expected_controls, atol=1.e-10)
             if index == 0:
                 assert np.dot(
-                    3.0 * (controls[:, 1] - controls[:, 0]), tangents[0]
+                    3.0 * (controls[:, 1] - controls[:, 0]),
+                    patch.preview_along_vectors[row_index][0],
                 ) > 0.0
             if index == main_edge_count - 1:
                 assert np.dot(
-                    3.0 * (controls[:, 3] - controls[:, 2]), tangents[-1]
+                    3.0 * (controls[:, 3] - controls[:, 2]),
+                    patch.preview_along_vectors[row_index][-1],
                 ) > 0.0
 
     assert case.view.current_extended_patch is None
@@ -4364,7 +4409,7 @@ def build_multi_layer_one_cap_case(
         ))
         previous = cap_node_index
     selected_edges = list(reversed(main_edges + cap_edges))
-    install_edge_owner_lookup(monkeypatch, selected_edges)
+    owners = install_edge_owner_lookup(monkeypatch, selected_edges)
     monkeypatch.setattr(
         grid_editor5, "boundary_list", list(selected_edges), raising=False
     )
@@ -4390,7 +4435,258 @@ def build_multi_layer_one_cap_case(
         app=app, scene=scene, view=view, nodes=nodes, patch=patch,
         main_edges=main_edges, cap_edges=cap_edges,
         cap_nodes=cap_nodes, selected_edges=selected_edges,
+        owners=owners,
     )
+
+
+def attach_old_cap_neighbors(case, cap_edges, cap_nodes, old_lengths, direction):
+    """Complete lightweight cap owners with their old-side logical neighbor."""
+    main_uv_index = case.patch.main_uv_index()
+    for cap_edge, cap_node, old_length in zip(
+        cap_edges, cap_nodes[1:], old_lengths
+    ):
+        owner = case.owners[cap_edge.element_index]
+        local_vertex = list(owner.vertices).index(cap_node.index)
+        adjacent_sides = {(local_vertex - 1) % 4, local_vertex}
+        old_side = (adjacent_sides - {cap_edge.element_side}).pop()
+        old_local_vertex = (
+            old_side if (old_side + 1) % 4 == local_vertex
+            else (local_vertex + 1) % 4
+        )
+        position = (
+            grid_editor5.np_point(cap_node.position)
+            - old_length * np.asarray(direction, dtype=float)
+        )
+        node_index = len(grid_editor5.node_list)
+        xx = np.zeros((2, 4))
+        xx[:, 0] = position
+        xx[:, main_uv_index] = [1.0 / 3.0, 0.0]
+        xx[:, main_uv_index % 2 + 1] = [0.0, 1.0 / 3.0]
+        old_node = jorek_node_item(node_index, xx, 2)
+        grid_editor5.node_list.append(old_node)
+        case.scene.addItem(old_node)
+        grid_editor5.jorek.nodes_xx = np.append(
+            grid_editor5.jorek.nodes_xx, xx[:, :, None], axis=2
+        )
+        owner.vertices[old_local_vertex] = node_index
+
+
+@pytest.mark.parametrize("new_length", [0.5, 1.0, 2.0])
+def test_cap_continuation_vector_scales_with_local_chord(monkeypatch, new_length):
+    cap = SimpleNamespace(
+        index=1, position=QPointF(0.0, 0.0),
+        xx=np.array([[0.0, 0.25, 0.0, 0.0],
+                     [0.0, 0.0, 0.25, 0.0]]),
+    )
+    nodes = [
+        SimpleNamespace(index=0, position=QPointF(0.0, -1.0)),
+        cap,
+        SimpleNamespace(index=2, position=QPointF(-1.0, 0.0)),
+        SimpleNamespace(index=3, position=QPointF(-1.0, -1.0)),
+    ]
+    owner = SimpleNamespace(
+        index=7, vertices=np.array([0, 1, 2, 3]),
+        sizes=np.ones((4, 4)), active=True,
+    )
+    owner.sizes[1, 1] = -2.0
+    cap_edge = SimpleNamespace(
+        element_index=7, element_side=0,
+        nodes=[nodes[0], cap], sizes=np.ones((2, 2)),
+    )
+    monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
+    monkeypatch.setattr(grid_editor5, "element_list", [owner], raising=False)
+
+    old_effective = -2.0 * cap.xx[:, 1]
+    result = grid_editor5.cap_continuation_basis_vector(
+        cap, QPointF(new_length, 0.0), 1, cap_edge
+    )
+
+    assert np.isclose(
+        np.linalg.norm(result) / np.linalg.norm(old_effective), new_length
+    )
+    assert np.isclose(
+        np.dot(result, -old_effective)
+        / (np.linalg.norm(result) * np.linalg.norm(old_effective)),
+        1.0,
+    )
+    assert np.linalg.norm(result) > 1.e-12
+
+
+def test_multi_layer_one_cap_scaled_vectors_survive_commit(monkeypatch):
+    case = build_multi_layer_one_cap_case(
+        monkeypatch, radial_layers=3, cap_at_start=True, main_edge_count=2
+    )
+    old_lengths = [0.5, 1.0, 2.0]
+    attach_old_cap_neighbors(
+        case, case.cap_edges, case.cap_nodes, old_lengths, [1.0, 0.0]
+    )
+    cap_snapshots = [np.array(node.xx, copy=True) for node in case.cap_nodes]
+    case.patch.enable_bezier_mode()
+
+    desired = {}
+    for radial_index, old_length in enumerate(old_lengths, start=1):
+        row = case.patch.preview_node_rows[radial_index]
+        new_length = np.linalg.norm(
+            grid_editor5.np_point(row[1].position)
+            - grid_editor5.np_point(row[0].position)
+        )
+        old_vector = np.array([1.0 / 3.0, 0.0])
+        vector = np.asarray(
+            case.patch.preview_along_vectors[radial_index][0]
+        )
+        assert np.isclose(
+            np.linalg.norm(vector) / np.linalg.norm(old_vector),
+            new_length / old_length,
+        )
+        assert np.isclose(
+            np.dot(vector, old_vector)
+            / (np.linalg.norm(vector) * np.linalg.norm(old_vector)), 1.0
+        )
+        desired[case.cap_nodes[radial_index].index] = vector
+
+    node_rows, elements = grid_editor5.add_extended_patch_to_nodes_elements(
+        case.patch
+    )
+    assert all(
+        np.array_equal(node.xx, snapshot)
+        for node, snapshot in zip(case.cap_nodes, cap_snapshots)
+    )
+    created_edges = {edge for element in elements for edge in element.edges}
+    for radial_index in range(1, 4):
+        cap_node, next_node = node_rows[radial_index][:2]
+        edge = next(
+            edge for edge in created_edges
+            if frozenset(edge.vertices)
+            == frozenset((cap_node.index, next_node.index))
+        )
+        endpoint = next(
+            index for index, node in enumerate(edge.nodes) if node is cap_node
+        )
+        assert np.allclose(
+            cap_node.xx[:, case.patch.main_uv_index()]
+            * edge.sizes[1, endpoint],
+            desired[cap_node.index],
+        )
+
+
+def test_two_cap_preview_scales_both_cap_continuations(monkeypatch):
+    case = build_two_cap_selection(monkeypatch, 2, main_edge_count=3)
+    patch = create_two_cap_patch(case)
+    case.patch = patch
+    attach_old_cap_neighbors(
+        case, case.start_cap_edges, case.start_nodes, [0.5, 2.0], [1.0, 0.0]
+    )
+    attach_old_cap_neighbors(
+        case, case.end_cap_edges, case.end_nodes, [2.0, 0.5], [-1.0, 0.0]
+    )
+    patch.enable_bezier_mode()
+
+    for radial_index in (1, 2):
+        row = patch.preview_node_rows[radial_index]
+        for column, old_length, direction in (
+            (0, [0.5, 2.0][radial_index - 1], np.array([1.0, 0.0])),
+            (-1, [2.0, 0.5][radial_index - 1], np.array([-1.0, 0.0])),
+        ):
+            neighbor = row[1] if column == 0 else row[-2]
+            new_length = np.linalg.norm(
+                grid_editor5.np_point(neighbor.position)
+                - grid_editor5.np_point(row[column].position)
+            )
+            vector = np.asarray(
+                patch.preview_along_vectors[radial_index][column]
+            )
+            assert np.isclose(np.linalg.norm(vector), new_length / old_length / 3.0)
+            oriented_vector = vector if column == 0 else -vector
+            assert np.dot(oriented_vector, direction) > 0.0
+
+
+@pytest.mark.parametrize("cap_at_start", [True, False])
+@pytest.mark.parametrize("requested_new_length", [1.0, 2.0])
+def test_one_cap_terminal_bezier_endpoint_uses_scaled_continuation(
+    monkeypatch, cap_at_start, requested_new_length
+):
+    case = build_multi_layer_one_cap_case(
+        monkeypatch, radial_layers=2, cap_at_start=cap_at_start,
+        main_edge_count=3,
+    )
+    continuation = np.array([1.0, 0.0]) if cap_at_start else np.array([-1.0, 0.0])
+    attach_old_cap_neighbors(
+        case, case.cap_edges, case.cap_nodes, [1.0, 1.0], continuation
+    )
+    fixed_node = case.cap_nodes[-1]
+    fixed_position = grid_editor5.np_point(fixed_node.position)
+    fixed_xx = np.array(fixed_node.xx, copy=True)
+    fixed_x = fixed_position[0]
+    if cap_at_start:
+        outer_positions = [
+            QPointF(fixed_x + requested_new_length * index, fixed_position[1])
+            for index in range(4)
+        ]
+    else:
+        outer_positions = [
+            QPointF(
+                fixed_x - requested_new_length * (3 - index),
+                fixed_position[1],
+            )
+            for index in range(4)
+        ]
+    case.patch.set_outer_positions(outer_positions)
+    case.patch.enable_bezier_mode()
+
+    endpoint_vector = (
+        case.patch.bezier_start_vector()
+        if cap_at_start else case.patch.bezier_end_vector()
+    )
+    neighbor = (
+        case.patch.outer_nodes[1]
+        if cap_at_start else case.patch.outer_nodes[-2]
+    )
+    new_length = np.linalg.norm(
+        grid_editor5.np_point(neighbor.position) - fixed_position
+    )
+    old_effective = grid_editor5.effective_node_basis_vector(
+        fixed_node, case.patch.main_uv_index(), case.cap_edges[-1]
+    )
+    if np.dot(old_effective, continuation) < 0.0:
+        old_effective = -old_effective
+
+    assert np.isclose(
+        np.linalg.norm(endpoint_vector) / np.linalg.norm(old_effective),
+        new_length,
+    )
+    assert np.isclose(
+        np.dot(endpoint_vector, old_effective)
+        / (np.linalg.norm(endpoint_vector) * np.linalg.norm(old_effective)),
+        1.0,
+    )
+    assert np.linalg.norm(endpoint_vector) > 1.e-12
+    assert np.array_equal(grid_editor5.np_point(fixed_node.position), fixed_position)
+    assert np.array_equal(fixed_node.xx, fixed_xx)
+
+    node_rows, elements = grid_editor5.add_extended_patch_to_nodes_elements(
+        case.patch
+    )
+    # One-cap commit normalizes rows into cap-first topology order.
+    cap_column = 0
+    neighbor_column = 1
+    cap_node = node_rows[-1][cap_column]
+    new_neighbor = node_rows[-1][neighbor_column]
+    outer_edge = next(
+        edge for element in elements for edge in element.edges
+        if frozenset(edge.vertices)
+        == frozenset((cap_node.index, new_neighbor.index))
+    )
+    endpoint = next(
+        index for index, node in enumerate(outer_edge.nodes)
+        if node is cap_node
+    )
+    committed_effective = (
+        cap_node.xx[:, case.patch.main_uv_index()]
+        * outer_edge.sizes[1, endpoint]
+    )
+    assert np.allclose(committed_effective, endpoint_vector)
+    assert np.array_equal(grid_editor5.np_point(fixed_node.position), fixed_position)
+    assert np.array_equal(fixed_node.xx, fixed_xx)
 
 
 def test_graphics_items_use_explicit_visual_layering(monkeypatch):
@@ -4661,6 +4957,11 @@ def test_multi_layer_one_cap_bezier_commit_preserves_final_curve(
                 node0: dt * working_tangents[index] / 3.0,
                 node1: -dt * working_tangents[index + 1] / 3.0,
             }
+            if node0 is node_rows[row_index][0]:
+                expected_effective[node0] = (
+                    (1.0 if cap_at_start else -1.0)
+                    * np.asarray(expected_vector_rows[row_index][0])
+                )
             for endpoint, node in enumerate(edge.nodes):
                 assert np.allclose(
                     node.xx[:, main_uv_index] * edge.sizes[1, endpoint],
@@ -4700,9 +5001,8 @@ def test_multi_layer_one_cap_bezier_commit_preserves_final_curve(
                 controls = controls[:, ::-1]
             assert np.allclose(controls, np.column_stack((
                 working_positions[index],
-                working_positions[index] + dt * working_tangents[index] / 3.0,
-                working_positions[index + 1]
-                - dt * working_tangents[index + 1] / 3.0,
+                working_positions[index] + expected_effective[node0],
+                working_positions[index + 1] + expected_effective[node1],
                 working_positions[index + 1],
             )), atol=1.e-10)
 
