@@ -1007,6 +1007,292 @@ def cubic_bezier_point_and_tangent(start, end, start_vector, end_vector, t):
     return point, tangent
 
 
+def cubic_bezier_controls(start, end, start_vector, end_vector):
+    """Return the four control points used by this module's cubic convention."""
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    return np.array([
+        start,
+        start + np.asarray(start_vector, dtype=float),
+        end + np.asarray(end_vector, dtype=float),
+        end,
+    ])
+
+
+def split_cubic_bezier_controls(controls, parameter):
+    """Split one cubic exactly at ``parameter`` using de Casteljau."""
+    controls = np.asarray(controls, dtype=float)
+    if controls.shape != (4, 2):
+        raise ValueError("Cubic Bezier controls must have shape (4, 2)")
+    if not 0.0 <= parameter <= 1.0:
+        raise ValueError("Cubic Bezier split parameter must be in [0, 1]")
+    level1 = (1.0 - parameter) * controls[:-1] + parameter * controls[1:]
+    level2 = (1.0 - parameter) * level1[:-1] + parameter * level1[1:]
+    point = (1.0 - parameter) * level2[0] + parameter * level2[1]
+    return (
+        np.array([controls[0], level1[0], level2[0], point]),
+        np.array([point, level2[1], level1[2], controls[3]]),
+    )
+
+
+def subdivide_cubic_bezier_controls(controls, parameters):
+    """Return exact cubic controls for consecutive parameter intervals."""
+    parameters = np.asarray(parameters, dtype=float)
+    if (
+        parameters.ndim != 1
+        or len(parameters) < 2
+        or not np.isclose(parameters[0], 0.0)
+        or not np.isclose(parameters[-1], 1.0)
+        or np.any(np.diff(parameters) <= 0.0)
+    ):
+        raise ValueError(
+            "Cubic subdivision parameters must increase strictly from 0 to 1"
+        )
+    remaining = np.asarray(controls, dtype=float)
+    segments = []
+    previous = 0.0
+    for parameter in parameters[1:-1]:
+        relative = (parameter - previous) / (1.0 - previous)
+        segment, remaining = split_cubic_bezier_controls(remaining, relative)
+        segments.append(segment)
+        previous = parameter
+    segments.append(remaining)
+    return segments
+
+
+def cubic_bezier_point_and_tangent_from_controls(controls, parameter):
+    controls = np.asarray(controls, dtype=float)
+    return cubic_bezier_point_and_tangent(
+        controls[0], controls[3],
+        controls[1] - controls[0], controls[2] - controls[3], parameter,
+    )
+
+
+def cubic_bezier_arc_parameters(controls, fractions, sample_count=1000):
+    """Map arc-length fractions to actual parameters of one cubic."""
+    controls = np.asarray(controls, dtype=float)
+    parameters = np.linspace(0.0, 1.0, sample_count + 1)
+    t = parameters[:, None]
+    one_minus_t = 1.0 - t
+    sampled_points = (
+        one_minus_t ** 3 * controls[0]
+        + 3.0 * one_minus_t ** 2 * t * controls[1]
+        + 3.0 * one_minus_t * t ** 2 * controls[2]
+        + t ** 3 * controls[3]
+    )
+    cumulative_lengths = np.concatenate((
+        [0.0], np.cumsum(np.linalg.norm(
+            np.diff(sampled_points, axis=0), axis=1
+        )),
+    ))
+    if cumulative_lengths[-1] == 0.0:
+        return np.asarray(fractions, dtype=float)
+    return np.interp(
+        fractions, cumulative_lengths / cumulative_lengths[-1], parameters
+    )
+
+
+def global_cubic_from_local_endpoint_controls(
+    start, end, start_local, end_local, arc_fractions,
+    sample_count=1000, max_iterations=80,
+):
+    """Fit one global cubic while retaining local endpoint control vectors.
+
+    ``end_local`` is the last segment's inward control vector (P2 - P3).
+    Arc-length matching and endpoint span scaling are a small coupled problem;
+    fixed-point iteration retains the actual converged Bezier parameters.
+    """
+    fractions = np.asarray(arc_fractions, dtype=float)
+    if (
+        fractions.ndim != 1
+        or len(fractions) < 2
+        or not np.isclose(fractions[0], 0.0)
+        or not np.isclose(fractions[-1], 1.0)
+        or np.any(np.diff(fractions) <= 0.0)
+    ):
+        raise ValueError("Arc fractions must increase strictly from 0 to 1")
+    parameters = np.array(fractions, copy=True)
+    for unused_iteration in range(max_iterations):
+        first_span = parameters[1]
+        last_span = 1.0 - parameters[-2]
+        controls = cubic_bezier_controls(
+            start, end,
+            np.asarray(start_local, dtype=float) / first_span,
+            np.asarray(end_local, dtype=float) / last_span,
+        )
+        matched = cubic_bezier_arc_parameters(
+            controls, fractions, sample_count=sample_count
+        )
+        if np.max(np.abs(matched - parameters)) < 2.e-11:
+            parameters = matched
+            break
+        # Damping avoids a two-cycle for strongly curved endpoint data.
+        parameters = 0.5 * (parameters + matched)
+    controls = cubic_bezier_controls(
+        start, end,
+        np.asarray(start_local, dtype=float) / parameters[1],
+        np.asarray(end_local, dtype=float) / (1.0 - parameters[-2]),
+    )
+    matched = cubic_bezier_arc_parameters(
+        controls, fractions, sample_count=sample_count
+    )
+    if np.max(np.abs(matched - parameters)) > 2.e-7:
+        raise ValueError("Global Bezier arc-parameter iteration did not converge")
+    parameters = matched
+    # One final rescale makes the endpoint identities exact for returned t_k.
+    controls = cubic_bezier_controls(
+        start, end,
+        np.asarray(start_local, dtype=float) / parameters[1],
+        np.asarray(end_local, dtype=float) / (1.0 - parameters[-2]),
+    )
+    points_and_tangents = [
+        cubic_bezier_point_and_tangent_from_controls(controls, parameter)
+        for parameter in parameters
+    ]
+    return {
+        "controls": controls,
+        "parameters": parameters,
+        "points": [item[0] for item in points_and_tangents],
+        "tangents": [item[1] for item in points_and_tangents],
+        "segments": subdivide_cubic_bezier_controls(controls, parameters),
+        "start_local": np.asarray(start_local, dtype=float),
+        "end_local": np.asarray(end_local, dtype=float),
+        "global_start_vector": controls[1] - controls[0],
+        "global_end_vector": controls[2] - controls[3],
+        "arc_fractions": np.array(fractions, copy=True),
+    }
+
+
+def global_cubic_data_from_controls(
+    controls, arc_fractions, sample_count=1000,
+):
+    """Sample and exactly subdivide explicit global cubic controls."""
+    controls = np.asarray(controls, dtype=float)
+    parameters = cubic_bezier_arc_parameters(
+        controls, arc_fractions, sample_count=sample_count
+    )
+    points_and_tangents = [
+        cubic_bezier_point_and_tangent_from_controls(controls, parameter)
+        for parameter in parameters
+    ]
+    return {
+        "controls": np.array(controls, copy=True),
+        "parameters": parameters,
+        "points": [item[0] for item in points_and_tangents],
+        "tangents": [item[1] for item in points_and_tangents],
+        "segments": subdivide_cubic_bezier_controls(controls, parameters),
+        "global_start_vector": controls[1] - controls[0],
+        "global_end_vector": controls[2] - controls[3],
+        "arc_fractions": np.asarray(arc_fractions, dtype=float),
+    }
+
+
+def cubic_bezier_surface_jacobian(control_net, u, v):
+    """Return det(dX/du, dX/dv) for a 4 by 4 Bezier control net."""
+    control_net = np.asarray(control_net, dtype=float)
+    if control_net.shape != (2, 4, 4):
+        raise ValueError("Bezier surface control net must have shape (2, 4, 4)")
+
+    def quadratic_basis(value):
+        return np.array([(1.0 - value) ** 2,
+                         2.0 * value * (1.0 - value), value ** 2])
+
+    def cubic_basis(value):
+        return np.array([
+            (1.0 - value) ** 3,
+            3.0 * value * (1.0 - value) ** 2,
+            3.0 * value ** 2 * (1.0 - value),
+            value ** 3,
+        ])
+
+    du_controls = 3.0 * np.diff(control_net, axis=1)
+    dv_controls = 3.0 * np.diff(control_net, axis=2)
+    du = np.einsum(
+        "i,xij,j->x", quadratic_basis(u), du_controls, cubic_basis(v)
+    )
+    dv = np.einsum(
+        "i,xij,j->x", cubic_basis(u), dv_controls, quadratic_basis(v)
+    )
+    return float(du[0] * dv[1] - du[1] * dv[0])
+
+
+def zero_mixed_bezier_control_net(
+    bottom, top, left, right, mixed_controls=None,
+):
+    """Assemble the tensor-product net for four compatible cubic edges.
+
+    ``mixed_controls`` follows corner order bottom-left, bottom-right,
+    top-left, top-right.  Omitting it retains the new-node zero-mixed rule.
+    """
+    bottom = np.asarray(bottom, dtype=float)
+    top = np.asarray(top, dtype=float)
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    if any(edge.shape != (4, 2) for edge in (bottom, top, left, right)):
+        raise ValueError("Each candidate element edge must have four 2D controls")
+    corners_match = (
+        np.allclose(bottom[0], left[0])
+        and np.allclose(bottom[3], right[0])
+        and np.allclose(top[0], left[3])
+        and np.allclose(top[3], right[3])
+    )
+    if not corners_match:
+        raise ValueError("Candidate element edges do not share their corners")
+    net = np.empty((2, 4, 4), dtype=float)
+    net[:, :, 0] = bottom.T
+    net[:, :, 3] = top.T
+    net[:, 0, :] = left.T
+    net[:, 3, :] = right.T
+    # New patch nodes use a zero raw mixed derivative.  The four interior
+    # controls are consequently position + the two adjacent controls.
+    if mixed_controls is None:
+        mixed_controls = [np.zeros(2) for unused_corner in range(4)]
+    if len(mixed_controls) != 4:
+        raise ValueError("Mixed controls must contain one vector per corner")
+    for mixed, (i, j, corner_i, corner_j) in zip(mixed_controls, (
+        (1, 1, 0, 0), (2, 1, 3, 0),
+        (1, 2, 0, 3), (2, 2, 3, 3),
+    )):
+        corner = net[:, corner_i, corner_j]
+        along = net[:, i, corner_j] - corner
+        radial = net[:, corner_i, j] - corner
+        net[:, i, j] = corner + along + radial + np.asarray(mixed)
+    return net
+
+
+def validate_bezier_control_nets(control_nets, sample_count=9):
+    """Require a consistent, scale-aware nonzero Jacobian in every net."""
+    if sample_count < 2:
+        raise ValueError("Jacobian sampling needs at least two points per axis")
+    minimum_signed = math.inf
+    details = []
+    for control_net in control_nets:
+        control_net = np.asarray(control_net, dtype=float)
+        span = np.ptp(control_net.reshape(2, -1), axis=1)
+        characteristic_length = max(float(np.linalg.norm(span)), 1.e-12)
+        tolerance = 1.e-8 * characteristic_length ** 2
+        corner_orientation = np.cross(
+            control_net[:, 3, 0] - control_net[:, 0, 0],
+            control_net[:, 0, 3] - control_net[:, 0, 0],
+        )
+        orientation = float(np.sign(corner_orientation))
+        if orientation == 0.0:
+            orientation = 1.0
+        signed_values = []
+        for u in np.linspace(0.0, 1.0, sample_count):
+            for v in np.linspace(0.0, 1.0, sample_count):
+                signed_values.append(
+                    orientation
+                    * cubic_bezier_surface_jacobian(control_net, u, v)
+                )
+        local_minimum = min(signed_values)
+        minimum_signed = min(minimum_signed, local_minimum)
+        details.append((local_minimum, tolerance))
+        if not np.isfinite(local_minimum) or local_minimum <= tolerance:
+            return False, minimum_signed, details
+    return True, minimum_signed, details
+
+
 def sample_cubic_bezier_by_arc_fractions(
     start, end, start_vector, end_vector, fractions, sample_count=1000
 ):
@@ -1196,6 +1482,14 @@ class extended_bezier_handle(QGraphicsEllipseItem):
         self.setZValue(Z_VECTOR_HANDLE)
 
     def move_to_scene(self, scene_position):
+        if self.role == "cap_global_tangent":
+            self.patch.move_one_cap_global_curve_handle(
+                self, scene_position
+            )
+            return
+        if self.role in ("global_start_tangent", "global_end_tangent"):
+            self.patch.move_global_cap_tangent_handle(self, scene_position)
+            return
         self.patch.automatic_outer_geometry = False
         new_position = self.patch.mapFromScene(scene_position)
         delta = new_position - self.pos()
@@ -1207,7 +1501,10 @@ class extended_bezier_handle(QGraphicsEllipseItem):
                 if handle.role == tangent_role
             )
             tangent_handle.setPos(tangent_handle.pos() + delta)
-        self.patch.update_bezier_from_handles()
+        if self.patch.one_cap_global_curve_only:
+            self.patch.update_one_cap_global_curve_from_handles()
+        else:
+            self.patch.update_bezier_from_handles()
 
 
 class extended_patch(QGraphicsPathItem):
@@ -1231,6 +1528,22 @@ class extended_patch(QGraphicsPathItem):
         self.bezier_handles = []
         self.outer_tangents = []
         self.outer_parameters = []
+        self.one_cap_global_rows = {}
+        self.one_cap_global_active = False
+        self.one_cap_global_minimum_jacobian = None
+        self._one_cap_global_warning_emitted = False
+        self._suppress_one_cap_global_warning = False
+        self._one_cap_baseline_outer = None
+        self.global_cap_tangent_length = None
+        self.global_cap_tangent_default_length = None
+        self.global_cap_tangent_direction = None
+        self.global_cap_tangent_last_valid_length = None
+        self.one_cap_global_curve_only = False
+        self.one_cap_global_curve_controls = None
+        self.one_cap_global_cap_at_start = None
+        self.one_cap_global_control_polygon = None
+        self.one_cap_outer_arc_fractions = None
+        self._one_cap_curve_diagnostic_printed = False
         self.base_radial_displacement = None
         self.automatic_outer_geometry = False
         self.redraw()
@@ -1240,6 +1553,25 @@ class extended_patch(QGraphicsPathItem):
         return len(self.ordered_nodes)
 
     def rebuild_intermediate_preview_rows(self):
+        if (
+            self.bezier_mode
+            and self.one_cap_topology is not None
+            and self._one_cap_baseline_outer is not None
+            and len(self.outer_nodes) == self.required_outer_node_count
+        ):
+            baseline = self._one_cap_baseline_outer
+            for node, position in zip(self.outer_nodes, baseline["points"]):
+                if isinstance(node, extended_patch_node):
+                    node.position = qt_point(position)
+            self.outer_tangents = [
+                np.array(tangent, copy=True) for tangent in baseline["tangents"]
+            ]
+            self.outer_parameters = np.array(
+                baseline["parameters"], copy=True
+            )
+        self.one_cap_global_rows = {}
+        self.one_cap_global_active = False
+        self.one_cap_global_minimum_jacobian = None
         defined_count = min(
             len(self.outer_nodes), self.required_outer_node_count
         )
@@ -1288,6 +1620,12 @@ class extended_patch(QGraphicsPathItem):
                     rows[row_index][-1] = topology.end_cap_nodes[row_index]
         self.preview_node_rows = rows
         self.rebuild_preview_along_vectors()
+        if (
+            self.bezier_mode
+            and self.one_cap_topology is not None
+            and not self.one_cap_global_curve_only
+        ):
+            self.rebuild_one_cap_global_rows()
 
     def outer_along_vectors(self):
         main_uv_index = self.main_uv_index()
@@ -1404,6 +1742,313 @@ class extended_patch(QGraphicsPathItem):
             for node, vector in zip(row, vectors):
                 if isinstance(node, extended_patch_node):
                     node.along_vector = np.array(vector, copy=True)
+
+    @staticmethod
+    def _edge_controls_in_order(edge, start_node, end_node):
+        controls = edge_bezier_points(edge.points)
+        controls = np.array([
+            controls[:, 0, 0], controls[:, 1, 0],
+            controls[:, 1, 1], controls[:, 0, 1],
+        ])
+        if edge.nodes[0] is start_node and edge.nodes[1] is end_node:
+            return controls
+        if edge.nodes[1] is start_node and edge.nodes[0] is end_node:
+            return controls[::-1]
+        raise ValueError("Bezier edge endpoints do not match the requested order")
+
+    def _one_cap_candidate_control_nets(self, cap_first_rows_data):
+        """Build candidate cell nets in cap-to-free, inner-to-outer order."""
+        topology = self.one_cap_topology
+        (
+            inner_nodes, inner_edges, cap_rows, cap_nodes, cap_edges,
+        ) = cap_first_rows(topology, self.preview_node_rows)
+        row_segments = {
+            0: [
+                self._edge_controls_in_order(
+                    next(
+                        edge for edge in inner_edges
+                        if frozenset(edge.vertices) == frozenset((
+                            inner_nodes[index].index,
+                            inner_nodes[index + 1].index,
+                        ))
+                    ),
+                    inner_nodes[index], inner_nodes[index + 1]
+                )
+                for index in range(len(inner_edges))
+            ]
+        }
+        row_segments.update({
+            radial_index: data["segments"]
+            for radial_index, data in cap_first_rows_data.items()
+        })
+        row_points = {
+            0: [np_point(node.position) for node in inner_nodes]
+        }
+        row_points.update({
+            radial_index: data["points"]
+            for radial_index, data in cap_first_rows_data.items()
+        })
+        control_nets = []
+        main_uv_index = self.main_uv_index()
+        radial_uv_index = main_uv_index % 2 + 1
+
+        def radial_controls(radial_index, column):
+            bottom = np.asarray(row_points[radial_index][column])
+            top = np.asarray(row_points[radial_index + 1][column])
+            if column == 0:
+                return self._edge_controls_in_order(
+                    cap_edges[radial_index],
+                    cap_nodes[radial_index], cap_nodes[radial_index + 1],
+                )
+            if radial_index == 0:
+                node = inner_nodes[column]
+                owner_edge = next(
+                    edge for edge in inner_edges
+                    if node.index in edge.vertices
+                    and (
+                        column == len(inner_nodes) - 1
+                        or inner_nodes[column - 1].index in edge.vertices
+                    )
+                )
+                radial_size = inherited_transverse_endpoint_size(
+                    owner_edge, node, qt_point(top)
+                )
+                outward = radial_size * np.asarray(
+                    node.xx[:, radial_uv_index], dtype=float
+                )
+            else:
+                previous = np.asarray(row_points[radial_index - 1][column])
+                outward = (bottom - previous) / 3.0
+            inward = (bottom - top) / 3.0
+            return np.array([bottom, bottom + outward, top + inward, top])
+
+        def effective_mixed(node, along, radial):
+            if not hasattr(node, "xx"):
+                return np.zeros(2)
+            raw_mixed = np.asarray(node.xx[:, 3], dtype=float)
+            if np.linalg.norm(raw_mixed) == 0.0:
+                return np.zeros(2)
+            along_size = basis_size_for_effective_vector(
+                node.xx[:, main_uv_index], along
+            )
+            radial_size = basis_size_for_effective_vector(
+                node.xx[:, radial_uv_index], radial
+            )
+            return along_size * radial_size * raw_mixed
+
+        for radial_index in range(self.radial_layers):
+            bottom_points = row_points[radial_index]
+            top_points = row_points[radial_index + 1]
+            for column in range(len(inner_edges)):
+                bottom = row_segments[radial_index][column]
+                top = row_segments[radial_index + 1][column]
+                left = radial_controls(radial_index, column)
+                right = radial_controls(radial_index, column + 1)
+                bottom_nodes = cap_rows[radial_index]
+                top_nodes = cap_rows[radial_index + 1]
+                mixed_controls = [
+                    effective_mixed(
+                        bottom_nodes[column],
+                        bottom[1] - bottom[0], left[1] - left[0],
+                    ),
+                    effective_mixed(
+                        bottom_nodes[column + 1],
+                        bottom[2] - bottom[3], right[1] - right[0],
+                    ),
+                    effective_mixed(
+                        top_nodes[column],
+                        top[1] - top[0], left[2] - left[3],
+                    ),
+                    effective_mixed(
+                        top_nodes[column + 1],
+                        top[2] - top[3], right[2] - right[3],
+                    ),
+                ]
+                control_nets.append(zero_mixed_bezier_control_net(
+                    bottom, top, left, right,
+                    mixed_controls=mixed_controls,
+                ))
+        return control_nets
+
+    def rebuild_one_cap_global_rows(self):
+        """Replace every new one-cap row by one exactly subdivided cubic."""
+        if (
+            len(self.preview_node_rows) != self.radial_layers + 1
+            or len(self.preview_along_vectors) != self.radial_layers + 1
+            or len(self.outer_nodes) != self.required_outer_node_count
+        ):
+            return
+        topology = self.one_cap_topology
+        if not all(
+            hasattr(topology, attribute)
+            for attribute in ("inner_nodes", "inner_edges")
+        ):
+            return
+        start_cap_edges = list(getattr(topology, "start_cap_edges", []) or [])
+        end_cap_edges = list(getattr(topology, "end_cap_edges", []) or [])
+        if bool(start_cap_edges) == bool(end_cap_edges):
+            return
+        if any(
+            not hasattr(edge, "points")
+            for edge in list(getattr(topology, "inner_edges", []))
+            + start_cap_edges + end_cap_edges
+        ):
+            return
+        cap_at_start = bool(start_cap_edges)
+        cap_edges = list(
+            start_cap_edges if cap_at_start else end_cap_edges
+        )
+        cap_first_data = {}
+        try:
+            for radial_index in range(1, self.radial_layers + 1):
+                baseline_row = self.preview_node_rows[radial_index]
+                baseline_vectors = self.preview_along_vectors[radial_index]
+                if cap_at_start:
+                    row = list(baseline_row)
+                    vectors = [np.asarray(vector) for vector in baseline_vectors]
+                else:
+                    row = list(reversed(baseline_row))
+                    vectors = [
+                        -np.asarray(vector)
+                        for vector in reversed(baseline_vectors)
+                    ]
+                fractions = cumulative_node_length_fractions(row)
+                if np.any(np.diff(fractions) <= 0.0):
+                    raise ValueError("One-cap baseline row has repeated nodes")
+                start = np_point(row[0].position)
+                end = np_point(row[-1].position)
+                start_local = cap_continuation_basis_vector(
+                    row[0], row[1], self.main_uv_index(),
+                    cap_edges[radial_index - 1],
+                    continuation_direction=end - start,
+                )
+                last_chord = np_point(row[-1].position - row[-2].position)
+                end_basis = np.asarray(vectors[-1], dtype=float)
+                end_sign = np.sign(np.inner(end_basis, -last_chord)) or -1.0
+                end_local = end_sign * end_basis
+                data = global_cubic_from_local_endpoint_controls(
+                    start, end, start_local, end_local, fractions
+                )
+                cap_first_data[radial_index] = data
+
+            default_outer = cap_first_data[self.radial_layers]
+            default_outer_vector = np.asarray(
+                default_outer["global_start_vector"], dtype=float
+            )
+            default_length = np.linalg.norm(default_outer_vector)
+            if not np.isfinite(default_length) or default_length <= 0.0:
+                raise ValueError("One-cap global tangent length is zero")
+            if self.global_cap_tangent_default_length is None:
+                self.global_cap_tangent_default_length = default_length
+            if self.global_cap_tangent_direction is None:
+                self.global_cap_tangent_direction = (
+                    default_outer_vector / default_length
+                )
+            if self.global_cap_tangent_length is not None:
+                scale = self.global_cap_tangent_length / default_length
+                adjusted_data = {}
+                for radial_index, default_data in cap_first_data.items():
+                    controls = np.array(default_data["controls"], copy=True)
+                    controls[1] = controls[0] + scale * (
+                        controls[1] - controls[0]
+                    )
+                    data = global_cubic_data_from_controls(
+                        controls, default_data["arc_fractions"]
+                    )
+                    data["start_local"] = (
+                        data["parameters"][1]
+                        * data["global_start_vector"]
+                    )
+                    data["end_local"] = (
+                        (1.0 - data["parameters"][-2])
+                        * data["global_end_vector"]
+                    )
+                    adjusted_data[radial_index] = data
+                cap_first_data = adjusted_data
+
+            control_nets = self._one_cap_candidate_control_nets(cap_first_data)
+            valid, minimum_jacobian, unused_details = (
+                validate_bezier_control_nets(control_nets, sample_count=9)
+            )
+            if not valid:
+                raise ValueError(
+                    "candidate Jacobian {:.6g} is non-positive or too small".format(
+                        minimum_jacobian
+                    )
+                )
+        except (ValueError, FloatingPointError) as error:
+            if (
+                not self._suppress_one_cap_global_warning
+                and not self._one_cap_global_warning_emitted
+            ):
+                print(
+                    "One-cap global Bezier rejected; using previous geometry:",
+                    error,
+                )
+                self._one_cap_global_warning_emitted = True
+            return
+
+        original_data = {}
+        for radial_index, data in cap_first_data.items():
+            if cap_at_start:
+                converted = dict(data)
+            else:
+                converted = dict(data)
+                converted["parameters"] = 1.0 - data["parameters"][::-1]
+                converted["points"] = list(reversed(data["points"]))
+                converted["tangents"] = [
+                    -tangent for tangent in reversed(data["tangents"])
+                ]
+                converted["segments"] = [
+                    segment[::-1] for segment in reversed(data["segments"])
+                ]
+                converted["start_local"] = np.array(
+                    data["end_local"], copy=True
+                )
+                converted["end_local"] = np.array(
+                    data["start_local"], copy=True
+                )
+                converted["global_start_vector"] = (
+                    converted["controls"][2] - converted["controls"][3]
+                )
+                converted["global_end_vector"] = (
+                    converted["controls"][1] - converted["controls"][0]
+                )
+                converted["controls"] = data["controls"][::-1]
+            original_data[radial_index] = converted
+            for node, position in zip(
+                self.preview_node_rows[radial_index], converted["points"]
+            ):
+                if isinstance(node, extended_patch_node):
+                    node.position = qt_point(position)
+            scales = bezier_nodal_parameter_scales(converted["parameters"])
+            raw_vectors = [
+                scales[index] * np.asarray(tangent) / 3.0
+                for index, tangent in enumerate(converted["tangents"])
+            ]
+            # A fixed cap node keeps its existing raw basis.  Expose the exact
+            # effective first-segment control in the preview vector array.
+            cap_column = 0 if cap_at_start else -1
+            raw_vectors[cap_column] = np.array(
+                data["start_local"] if cap_at_start else -data["start_local"],
+                copy=True,
+            )
+            self.preview_along_vectors[radial_index] = raw_vectors
+            for node, vector in zip(
+                self.preview_node_rows[radial_index], raw_vectors
+            ):
+                if isinstance(node, extended_patch_node):
+                    node.along_vector = np.array(vector, copy=True)
+
+        self.one_cap_global_rows = original_data
+        self.one_cap_global_active = True
+        self._one_cap_global_warning_emitted = False
+        self.one_cap_global_minimum_jacobian = minimum_jacobian
+        outer_data = original_data[self.radial_layers]
+        self.outer_parameters = np.array(outer_data["parameters"], copy=True)
+        self.outer_tangents = [
+            np.array(tangent, copy=True) for tangent in outer_data["tangents"]
+        ]
 
     def set_radial_layers(self, nr):
         if not 1 <= nr <= 9:
@@ -1556,9 +2201,111 @@ class extended_patch(QGraphicsPathItem):
             extended_patch_node(position) for position in positions
         ]
         self.automatic_outer_geometry = automatic
+        if self.one_cap_global_curve_only:
+            fixed_start = self.fixed_bezier_start_node()
+            fixed_end = self.fixed_bezier_end_node()
+            if fixed_start is not None:
+                self.outer_nodes[0] = fixed_start
+                endpoint_role = "end"
+                free_position = self.outer_nodes[-1].position
+            else:
+                self.outer_nodes[-1] = fixed_end
+                endpoint_role = "start"
+                free_position = self.outer_nodes[0].position
+            handles = {handle.role: handle for handle in self.bezier_handles}
+            endpoint_handle = handles[endpoint_role]
+            tangent_handle = handles[endpoint_role + "_tangent"]
+            delta = free_position - endpoint_handle.pos()
+            endpoint_handle.setPos(free_position)
+            tangent_handle.setPos(tangent_handle.pos() + delta)
+            self.update_one_cap_global_curve_from_handles()
+            return
         self.redraw()
 
-    def enable_bezier_mode(self):
+    def initial_one_cap_global_curve_controls(self, start, end):
+        """Initialize one global cubic independently of mesh subdivision."""
+        topology = self.one_cap_topology
+        cap_at_start = topology.outer_start_node is not None
+        start_array = np_point(start)
+        end_array = np_point(end)
+        chord = end_array - start_array
+        chord_length = np.linalg.norm(chord)
+        if not np.isfinite(chord_length) or chord_length == 0.0:
+            raise ValueError("One-cap global curve has zero chord length")
+        handles = {handle.role: handle for handle in self.bezier_handles}
+        if cap_at_start:
+            cap_edges = topology.start_cap_edges
+            fixed_node = topology.outer_start_node
+            free_control = np_point(handles["end_tangent"].pos())
+            continuation = chord
+            free_endpoint = end_array
+        else:
+            cap_edges = topology.end_cap_edges
+            fixed_node = topology.outer_end_node
+            free_control = np_point(handles["start_tangent"].pos())
+            continuation = -chord
+            free_endpoint = start_array
+        inherited = cap_continuation_basis_vector(
+            fixed_node, qt_point(free_endpoint), self.main_uv_index(),
+            cap_edges[-1] if cap_edges else None,
+            continuation_direction=continuation,
+        )
+        inherited_norm = np.linalg.norm(inherited)
+        if not np.isfinite(inherited_norm) or inherited_norm == 0.0:
+            inherited = continuation
+            inherited_norm = chord_length
+        cap_vector = chord_length * inherited / (3.0 * inherited_norm)
+        if cap_at_start:
+            return np.array([
+                start_array, start_array + cap_vector,
+                free_control, end_array,
+            ])
+        return np.array([
+            start_array, free_control, end_array + cap_vector, end_array,
+        ])
+
+    def enable_one_cap_global_curve_only(self, start, end, has_start_cap):
+        """Expose an isolated editable 1D global outer-boundary cubic."""
+        controls = self.initial_one_cap_global_curve_controls(start, end)
+        self.one_cap_global_curve_only = True
+        self.one_cap_global_cap_at_start = bool(has_start_cap)
+        self.one_cap_global_curve_controls = controls
+        if has_start_cap:
+            cap_vector = controls[1] - controls[0]
+            free_positions = {
+                "end": controls[3], "end_tangent": controls[2]
+            }
+            fixed_position = self.bezier_start_position()
+        else:
+            cap_vector = controls[2] - controls[3]
+            free_positions = {
+                "start": controls[0], "start_tangent": controls[1]
+            }
+            fixed_position = self.bezier_end_position()
+        for handle in self.bezier_handles:
+            if handle.role in free_positions:
+                handle.setPos(qt_point(free_positions[handle.role]))
+        length = np.linalg.norm(cap_vector)
+        if not np.isfinite(length) or length <= 0.0:
+            raise ValueError("One-cap global tangent length is zero")
+        self.global_cap_tangent_length = length
+        self.global_cap_tangent_default_length = length
+        self.global_cap_tangent_last_valid_length = length
+        self.global_cap_tangent_direction = cap_vector / length
+        self.bezier_handles.append(extended_bezier_handle(
+            self, "cap_global_tangent",
+            fixed_position + qt_point(cap_vector), QColor(255, 128, 0),
+        ))
+        control_pen = QPen(QColor(96, 96, 96))
+        control_pen.setWidthF(0.9)
+        control_pen.setCosmetic(True)
+        self.one_cap_global_control_polygon = QGraphicsPathItem(self)
+        self.one_cap_global_control_polygon.setPen(control_pen)
+        self.one_cap_global_control_polygon.setZValue(0.25)
+        self.update_one_cap_global_curve_from_handles()
+        self.print_one_cap_global_curve_diagnostic()
+
+    def enable_bezier_mode(self, one_cap_curve_only=False):
         if self.bezier_mode:
             return
         topology = self.one_cap_topology or self.capped_gap
@@ -1606,7 +2353,249 @@ class extended_patch(QGraphicsPathItem):
                 QColor(0, 255, 255),
             ))
         self.bezier_mode = True
+        if one_cap_curve_only and self.one_cap_topology is not None:
+            self.enable_one_cap_global_curve_only(
+                start, end, has_start_cap
+            )
+            return
         self.update_bezier_from_handles()
+        if self.one_cap_topology is not None:
+            role = (
+                "global_start_tangent"
+                if has_start_cap else "global_end_tangent"
+            )
+            fixed_position = (
+                self.bezier_start_position()
+                if has_start_cap else self.bezier_end_position()
+            )
+            if self.one_cap_global_active:
+                vector = (
+                    self.bezier_start_vector()
+                    if has_start_cap else self.bezier_end_vector()
+                )
+            elif (
+                self.global_cap_tangent_direction is not None
+                and self.global_cap_tangent_default_length is not None
+            ):
+                vector = (
+                    self.global_cap_tangent_default_length
+                    * np.asarray(
+                        self.global_cap_tangent_direction, dtype=float
+                    )
+                )
+            else:
+                vector = np.zeros(2)
+            length = np.linalg.norm(vector)
+            if np.isfinite(length) and length > 0.0:
+                self.global_cap_tangent_length = length
+                self.global_cap_tangent_last_valid_length = (
+                    length if self.one_cap_global_active else None
+                )
+                self.global_cap_tangent_direction = vector / length
+                self.bezier_handles.append(extended_bezier_handle(
+                    self, role, fixed_position + qt_point(vector),
+                    QColor(255, 128, 0),
+                ))
+                self.redraw(rebuild_rows=False)
+
+    def global_cap_tangent_handle(self):
+        return next((
+            handle for handle in self.bezier_handles
+            if handle.role in (
+                "cap_global_tangent", "global_start_tangent",
+                "global_end_tangent",
+            )
+        ), None)
+
+    def update_one_cap_global_curve_from_handles(self):
+        """Update authoritative controls and rebuild their patch preview."""
+        if not self.one_cap_global_curve_only:
+            return
+        handles = {handle.role: handle for handle in self.bezier_handles}
+        direction = np.asarray(
+            self.global_cap_tangent_direction, dtype=float
+        )
+        cap_vector = self.global_cap_tangent_length * direction
+        if self.one_cap_global_cap_at_start:
+            fixed = np_point(self.bezier_start_position())
+            controls = np.array([
+                fixed,
+                fixed + cap_vector,
+                np_point(handles["end_tangent"].pos()),
+                np_point(handles["end"].pos()),
+            ])
+        else:
+            fixed = np_point(self.bezier_end_position())
+            controls = np.array([
+                np_point(handles["start"].pos()),
+                np_point(handles["start_tangent"].pos()),
+                fixed + cap_vector,
+                fixed,
+            ])
+        self.one_cap_global_curve_controls = controls
+        handles["cap_global_tangent"].setPos(
+            qt_point(fixed + cap_vector)
+        )
+        self.resample_one_cap_global_outer_curve()
+        self.redraw(rebuild_rows=False)
+
+    def resample_one_cap_global_outer_curve(self):
+        """Sample authoritative controls without feeding samples back to them."""
+        controls = np.asarray(self.one_cap_global_curve_controls, dtype=float)
+        controls_before = np.array(controls, copy=True)
+        fractions = cumulative_node_length_fractions(self.ordered_nodes)
+        points, tangents, parameters = sample_cubic_bezier_by_arc_fractions(
+            controls[0], controls[3],
+            controls[1] - controls[0], controls[2] - controls[3],
+            fractions,
+        )
+        sampled_nodes = [
+            extended_patch_node(qt_point(point)) for point in points
+        ]
+        if self.one_cap_global_cap_at_start:
+            sampled_nodes[0] = self.one_cap_topology.outer_start_node
+        else:
+            sampled_nodes[-1] = self.one_cap_topology.outer_end_node
+        self.outer_nodes = sampled_nodes
+        self.outer_tangents = [
+            np.array(tangent, copy=True) for tangent in tangents
+        ]
+        self.outer_parameters = np.array(parameters, copy=True)
+        self.one_cap_outer_arc_fractions = np.array(fractions, copy=True)
+        self._one_cap_baseline_outer = None
+        self.rebuild_intermediate_preview_rows()
+        if not np.array_equal(
+            self.one_cap_global_curve_controls, controls_before
+        ):
+            raise RuntimeError("Patch preview modified global curve controls")
+
+    def move_one_cap_global_curve_handle(self, handle, scene_position):
+        """Slide the isolated curve's cap control along its fixed tangent."""
+        if (
+            not self.one_cap_global_curve_only
+            or handle is not self.global_cap_tangent_handle()
+        ):
+            raise ValueError("Cap tangent handle does not belong to curve")
+        direction = np.asarray(
+            self.global_cap_tangent_direction, dtype=float
+        )
+        direction /= np.linalg.norm(direction)
+        fixed_position = (
+            self.bezier_start_position()
+            if self.one_cap_global_cap_at_start
+            else self.bezier_end_position()
+        )
+        fixed = np_point(fixed_position)
+        mouse = np_point(self.mapFromScene(scene_position))
+        controls = np.asarray(self.one_cap_global_curve_controls)
+        geometry_scale = max(
+            np.linalg.norm(controls[3] - controls[0]),
+            float(self.global_cap_tangent_default_length), 1.e-12,
+        )
+        minimum_length = 1.e-6 * geometry_scale
+        self.global_cap_tangent_length = max(
+            float(np.inner(mouse - fixed, direction)), minimum_length
+        )
+        self.global_cap_tangent_last_valid_length = (
+            self.global_cap_tangent_length
+        )
+        self.automatic_outer_geometry = False
+        self.update_one_cap_global_curve_from_handles()
+        return True
+
+    def print_one_cap_global_curve_diagnostic(self):
+        if self._one_cap_curve_diagnostic_printed:
+            return
+        controls = np.asarray(self.one_cap_global_curve_controls)
+        print("One-cap global 1D Bezier controls:")
+        for index, control in enumerate(controls):
+            print("  P{} = {}".format(index, control))
+        print("  cap tangent unit =", self.global_cap_tangent_direction)
+        print("  lambda_cap =", self.global_cap_tangent_length)
+        for handle in self.bezier_handles:
+            position = handle.pos()
+            scene_position = handle.scenePos()
+            print(
+                "  handle {} pos=({}, {}) scenePos=({}, {}) "
+                "visible={} enabled={}".format(
+                    handle.role, position.x(), position.y(),
+                    scene_position.x(), scene_position.y(),
+                    handle.isVisible(), handle.isEnabled(),
+                )
+            )
+        self._one_cap_curve_diagnostic_printed = True
+
+    def sync_global_cap_tangent_handle(self):
+        handle = self.global_cap_tangent_handle()
+        if handle is None or not self.one_cap_global_active:
+            return
+        if handle.role == "global_start_tangent":
+            fixed_position = self.bezier_start_position()
+            vector = self.bezier_start_vector()
+        else:
+            fixed_position = self.bezier_end_position()
+            vector = self.bezier_end_vector()
+        handle.setPos(fixed_position + qt_point(vector))
+
+    def set_interactive_patch_status(self, message):
+        patch_scene = self.scene()
+        if patch_scene is None:
+            return
+        for patch_view in patch_scene.views():
+            if (
+                getattr(patch_view, "current_extended_patch", None) is self
+                and hasattr(patch_view, "set_patch_status")
+            ):
+                patch_view.set_patch_status(message)
+
+    def move_global_cap_tangent_handle(self, handle, scene_position):
+        """Project a cap-side global handle drag onto its inherited tangent."""
+        if handle is not self.global_cap_tangent_handle():
+            raise ValueError("Global cap tangent handle does not belong to patch")
+        direction = np.asarray(
+            self.global_cap_tangent_direction, dtype=float
+        )
+        direction_norm = np.linalg.norm(direction)
+        if not np.isfinite(direction_norm) or direction_norm == 0.0:
+            return False
+        direction = direction / direction_norm
+        fixed_position = (
+            self.bezier_start_position()
+            if handle.role == "global_start_tangent"
+            else self.bezier_end_position()
+        )
+        fixed = np_point(fixed_position)
+        mouse = np_point(self.mapFromScene(scene_position))
+        chord_length = np.linalg.norm(
+            np_point(self.bezier_end_position())
+            - np_point(self.bezier_start_position())
+        )
+        geometry_scale = max(
+            chord_length,
+            float(self.global_cap_tangent_default_length or 0.0),
+            1.e-12,
+        )
+        minimum_length = 1.e-6 * geometry_scale
+        proposed_length = max(
+            float(np.inner(mouse - fixed, direction)), minimum_length
+        )
+        previous_length = self.global_cap_tangent_length
+        self.global_cap_tangent_length = proposed_length
+        self.automatic_outer_geometry = False
+        self._suppress_one_cap_global_warning = True
+        try:
+            self.update_bezier_from_handles()
+            if not self.one_cap_global_active:
+                self.global_cap_tangent_length = previous_length
+                self.update_bezier_from_handles()
+                self.sync_global_cap_tangent_handle()
+                self.set_interactive_patch_status("Invalid patch geometry")
+                return False
+            self.global_cap_tangent_last_valid_length = proposed_length
+            self.sync_global_cap_tangent_handle()
+            return True
+        finally:
+            self._suppress_one_cap_global_warning = False
 
     def fixed_bezier_start_node(self):
         topology = self.one_cap_topology or self.capped_gap
@@ -1642,6 +2631,9 @@ class extended_patch(QGraphicsPathItem):
         return self.ordered_edges[0].uv_index
 
     def bezier_start_vector(self):
+        if self.one_cap_global_active and self.radial_layers in self.one_cap_global_rows:
+            controls = self.one_cap_global_rows[self.radial_layers]["controls"]
+            return np.asarray(controls[1] - controls[0], dtype=float)
         fixed_node = self.fixed_bezier_start_node()
         start = np_point(self.bezier_start_position())
         end = np_point(self.bezier_end_position())
@@ -1668,6 +2660,9 @@ class extended_patch(QGraphicsPathItem):
         return np_point(tangent_position - self.bezier_start_position())
 
     def bezier_end_vector(self):
+        if self.one_cap_global_active and self.radial_layers in self.one_cap_global_rows:
+            controls = self.one_cap_global_rows[self.radial_layers]["controls"]
+            return np.asarray(controls[2] - controls[3], dtype=float)
         fixed_node = self.fixed_bezier_end_node()
         start = np_point(self.bezier_start_position())
         end = np_point(self.bezier_end_position())
@@ -1695,6 +2690,10 @@ class extended_patch(QGraphicsPathItem):
         return np_point(tangent_position - self.bezier_end_position())
 
     def update_bezier_from_handles(self):
+        self.one_cap_global_rows = {}
+        self.one_cap_global_active = False
+        self._one_cap_baseline_outer = None
+        self._one_cap_global_warning_emitted = False
         start_position = self.bezier_start_position()
         end_position = self.bezier_end_position()
         start = np_point(start_position)
@@ -1714,7 +2713,18 @@ class extended_patch(QGraphicsPathItem):
             self.outer_nodes[-1] = fixed_end_node
         self.outer_tangents = tangents
         self.outer_parameters = parameters
+        if self.one_cap_topology is not None:
+            self._one_cap_baseline_outer = {
+                "points": [np.array(point, copy=True) for point in points],
+                "tangents": [
+                    np.array(tangent, copy=True) for tangent in tangents
+                ],
+                "parameters": np.array(parameters, copy=True),
+                "start_vector": np.array(start_vector, copy=True),
+                "end_vector": np.array(end_vector, copy=True),
+            }
         self.redraw()
+        self.sync_global_cap_tangent_handle()
 
     @staticmethod
     def add_curved_preview_row(path, row, vectors):
@@ -1733,10 +2743,66 @@ class extended_patch(QGraphicsPathItem):
                 end,
             )
 
+    @staticmethod
+    def add_exact_curved_preview_row(path, segments):
+        if not segments:
+            return
+        path.moveTo(qt_point(segments[0][0]))
+        for segment in segments:
+            path.cubicTo(
+                qt_point(segment[1]), qt_point(segment[2]),
+                qt_point(segment[3]),
+            )
+
     def redraw(self, rebuild_rows=True):
+        path = QPainterPath()
+        if (
+            self.one_cap_global_curve_only
+            and self.one_cap_global_curve_controls is not None
+        ):
+            controls = np.asarray(self.one_cap_global_curve_controls)
+            path.moveTo(qt_point(controls[0]))
+            path.cubicTo(
+                qt_point(controls[1]), qt_point(controls[2]),
+                qt_point(controls[3]),
+            )
+            control_path = QPainterPath()
+            control_path.moveTo(qt_point(controls[0]))
+            control_path.lineTo(qt_point(controls[1]))
+            control_path.moveTo(qt_point(controls[2]))
+            control_path.lineTo(qt_point(controls[3]))
+            if self.one_cap_global_control_polygon is not None:
+                self.one_cap_global_control_polygon.setPath(control_path)
+            if self.outer_nodes:
+                outer_row_index = len(self.preview_node_rows) - 1
+                for row_index, row in enumerate(self.preview_node_rows):
+                    if not row or row_index == outer_row_index:
+                        continue
+                    if (
+                        0 < row_index < outer_row_index
+                        and len(self.preview_along_vectors)
+                        == len(self.preview_node_rows)
+                    ):
+                        self.add_curved_preview_row(
+                            path, row,
+                            self.preview_along_vectors[row_index],
+                        )
+                    else:
+                        path.moveTo(row[0].position)
+                        for node in row[1:]:
+                            path.lineTo(node.position)
+                for row0, row1 in zip(
+                    self.preview_node_rows[:-1],
+                    self.preview_node_rows[1:],
+                ):
+                    for node0, node1 in zip(row0, row1):
+                        path.moveTo(node0.position)
+                        path.lineTo(node1.position)
+            self.setPath(path)
+            self.update()
+            return
         if rebuild_rows:
             self.rebuild_intermediate_preview_rows()
-        path = QPainterPath()
         if self.one_cap_topology is not None and not self.outer_nodes:
             topology = self.one_cap_topology
             if topology.outer_start_node is not None:
@@ -1745,7 +2811,7 @@ class extended_patch(QGraphicsPathItem):
             else:
                 path.moveTo(self.ordered_nodes[-1].position)
                 path.lineTo(topology.outer_end_node.position)
-        if self.bezier_mode:
+        if self.bezier_mode and not self.one_cap_global_active:
             start = self.bezier_start_position()
             end = self.bezier_end_position()
             path.moveTo(start)
@@ -1753,6 +2819,9 @@ class extended_patch(QGraphicsPathItem):
                 start + qt_point(self.bezier_start_vector()),
                 end + qt_point(self.bezier_end_vector()), end,
             )
+        if self.bezier_mode:
+            start = self.bezier_start_position()
+            end = self.bezier_end_position()
             handles = {handle.role: handle for handle in self.bezier_handles}
             if "start_tangent" in handles:
                 path.moveTo(start)
@@ -1760,15 +2829,30 @@ class extended_patch(QGraphicsPathItem):
             if "end_tangent" in handles:
                 path.moveTo(end)
                 path.lineTo(handles["end_tangent"].pos())
+            if "global_start_tangent" in handles:
+                path.moveTo(start)
+                path.lineTo(handles["global_start_tangent"].pos())
+            if "global_end_tangent" in handles:
+                path.moveTo(end)
+                path.lineTo(handles["global_end_tangent"].pos())
         if self.outer_nodes:
             for row_index, row in enumerate(self.preview_node_rows):
                 if (
                     not row
                     or (
                         self.bezier_mode
+                        and not self.one_cap_global_active
                         and row_index == len(self.preview_node_rows) - 1
                     )
                 ):
+                    continue
+                if (
+                    self.one_cap_global_active
+                    and row_index in self.one_cap_global_rows
+                ):
+                    self.add_exact_curved_preview_row(
+                        path, self.one_cap_global_rows[row_index]["segments"]
+                    )
                     continue
                 if (
                     self.bezier_mode
@@ -2244,7 +3328,9 @@ class this_view(QGraphicsView):
         if self.current_extended_patch.bezier_mode:
             self.update_patch_controls()
             return False
-        self.current_extended_patch.enable_bezier_mode()
+        self.current_extended_patch.enable_bezier_mode(
+            one_cap_curve_only=True
+        )
         self.pending_bezier_mode = True
         self.set_patch_status("Bézier enabled")
         self.update_patch_controls()
@@ -4172,6 +5258,20 @@ def cap_first_bezier_data(patch, topology):
     return tangents, parameters
 
 
+def cap_first_global_bezier_row_data(patch, topology, radial_index):
+    """Return one exact global row in the commit path's cap-first order."""
+    data = patch.one_cap_global_rows[radial_index]
+    parameters = np.asarray(data["parameters"], dtype=float)
+    tangents = [np.asarray(tangent, dtype=float) for tangent in data["tangents"]]
+    segments = [np.asarray(segment, dtype=float) for segment in data["segments"]]
+    if not topology.start_cap_edges:
+        parameters = 1.0 - parameters[::-1]
+        tangents = [-tangent for tangent in reversed(tangents)]
+        segments = [segment[::-1] for segment in reversed(segments)]
+    bezier_nodal_parameter_scales(parameters)
+    return tangents, parameters, segments
+
+
 def add_one_cap_extended_row(
     inner_nodes, inner_edges, target_positions, cap_edge, fixed_outer_node,
     reference_inner_nodes=None, along_tangents=None, along_parameters=None,
@@ -4369,6 +5469,27 @@ def add_one_cap_gap_to_nodes_elements(patch):
         target_positions = [
             node.position for node in preview_node_rows[radial_index + 1]
         ]
+        row_tangents = row_parameters = None
+        fixed_cap_effective_vector = None
+        if patch.bezier_mode and patch.one_cap_global_active:
+            row_tangents, row_parameters, unused_segments = (
+                cap_first_global_bezier_row_data(
+                    patch, topology, radial_index + 1
+                )
+            )
+            first_interval = row_parameters[1] - row_parameters[0]
+            fixed_cap_effective_vector = (
+                first_interval * np.asarray(row_tangents[0]) / 3.0
+            )
+        elif patch.bezier_mode:
+            if radial_index == patch.radial_layers - 1:
+                row_tangents, row_parameters = (
+                    working_tangents, working_parameters
+                )
+            fixed_cap_effective_vector = (
+                (1.0 if topology.start_cap_edges else -1.0)
+                * np.asarray(working_vector_rows[radial_index + 1][0])
+            )
         row_result = add_one_cap_extended_row(
             inner_nodes, inner_edges, target_positions,
             cap_edges[radial_index], cap_nodes[radial_index + 1],
@@ -4376,22 +5497,17 @@ def add_one_cap_gap_to_nodes_elements(patch):
                 reference_inner_nodes if patch.radial_layers > 1 else None
             ),
             along_tangents=(
-                working_tangents
-                if radial_index == patch.radial_layers - 1 else None
+                row_tangents
             ),
             along_parameters=(
-                working_parameters
-                if radial_index == patch.radial_layers - 1 else None
+                row_parameters
             ),
             along_basis_vectors=(
                 working_vector_rows[radial_index + 1]
                 if working_vector_rows is not None else None
             ),
             fixed_cap_effective_vector=(
-                (
-                    1.0 if topology.start_cap_edges else -1.0
-                ) * np.asarray(working_vector_rows[radial_index + 1][0])
-                if working_vector_rows is not None else None
+                fixed_cap_effective_vector
             ),
         )
         if row_result is None:
