@@ -7,16 +7,19 @@ import tempfile
 import time
 import ctypes
 import numpy as np
-from PySide2.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QTimer
+from PySide2.QtCore import (
+    Qt, QEvent, QPoint, QPointF, QRect, QRectF, QSize, QTimer,
+)
 from PySide2.QtGui import (
     QPen, QFont, QBrush, QColor, QMouseEvent, QPainter, QPainterPath,
-    QPainterPathStroker, QTransform,
+    QPainterPathStroker, QKeySequence, QTransform,
 )
 from PySide2.QtWidgets import (
-    QAction, QApplication, QComboBox, QFileDialog, QGraphicsEllipseItem, QGraphicsItem,
-    QGraphicsPathItem, QGraphicsScene, QGraphicsView, QGroupBox,
-    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QRubberBand,
-    QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+    QAbstractSpinBox, QAction, QApplication, QComboBox, QFileDialog,
+    QGraphicsEllipseItem, QGraphicsItem, QGraphicsPathItem, QGraphicsScene,
+    QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPlainTextEdit, QPushButton, QRubberBand, QSizePolicy,
+    QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from jorek             import *
@@ -50,6 +53,7 @@ Z_NODE = 2.0
 Z_VECTOR_HANDLE = 4.0
 WALL_OUTLINE_COLOR = QColor(128, 0, 128)
 WALL_OUTLINE_WIDTH = 2.0
+MAX_RADIAL_LAYERS = 99
 
 this_scaling = 100.0
 node_list = []
@@ -2051,8 +2055,12 @@ class extended_patch(QGraphicsPathItem):
         ]
 
     def set_radial_layers(self, nr):
-        if not 1 <= nr <= 9:
-            raise ValueError("Radial layer count must be between 1 and 9")
+        if not 1 <= nr <= MAX_RADIAL_LAYERS:
+            raise ValueError(
+                "Radial layer count must be between 1 and {}".format(
+                    MAX_RADIAL_LAYERS
+                )
+            )
         topology = self.one_cap_topology or self.capped_gap
         if topology is not None and (
             getattr(topology, "start_cap_edges", [])
@@ -3000,12 +3008,42 @@ class this_view(QGraphicsView):
         fit_rect = grid_rect.adjusted(
             -margin_x, -margin_y, margin_x, margin_y
         )
+        # When the whole scene fits, QGraphicsView has no scrollbar range and
+        # aligns sceneRect() rather than the rectangle passed to fitInView().
+        # Graphics handles can make those rectangles have different centers.
+        # Use the persistent fit bounds as the fitted-mode scrollable rectangle
+        # as well, avoiding both that mismatch and scrollbar visibility churn.
+        fit_center = fit_rect.center()
+        self._view_adjustment_in_progress = True
+        try:
+            self.setSceneRect(fit_rect)
+            self.apply_view_scale(1.0)
+            self.fitInView(fit_rect, Qt.KeepAspectRatio)
+            self.centerOn(fit_center)
+            transform = self.transform()
+            self.zoom_level = math.hypot(transform.m11(), transform.m12())
+        finally:
+            self._view_adjustment_in_progress = False
+
+    def restore_full_scene_rect(self):
+        """Restore all-item scroll bounds before leaving fitted view mode."""
+        if self.scene() is None:
+            return
+        center = self.mapToScene(self.viewport().rect().center())
+        self._view_adjustment_in_progress = True
+        try:
+            self.setSceneRect(self.scene().sceneRect())
+            self.centerOn(center)
+        finally:
+            self._view_adjustment_in_progress = False
+
+    def reset_zoom(self):
+        print("resetting zoom_level to 1")
+        self.auto_fit_on_resize = False
+        self.restore_full_scene_rect()
         self._view_adjustment_in_progress = True
         try:
             self.apply_view_scale(1.0)
-            self.fitInView(fit_rect, Qt.KeepAspectRatio)
-            transform = self.transform()
-            self.zoom_level = math.hypot(transform.m11(), transform.m12())
         finally:
             self._view_adjustment_in_progress = False
 
@@ -3268,8 +3306,12 @@ class this_view(QGraphicsView):
         self.update_patch_controls()
 
     def set_extended_radial_layers(self, nr):
-        if not 1 <= nr <= 9:
-            raise ValueError("Radial layer count must be between 1 and 9")
+        if not 1 <= nr <= MAX_RADIAL_LAYERS:
+            raise ValueError(
+                "Radial layer count must be between 1 and {}".format(
+                    MAX_RADIAL_LAYERS
+                )
+            )
         patch = self.current_extended_patch
         if patch is None:
             self.pending_radial_layers = nr
@@ -3522,10 +3564,6 @@ class this_view(QGraphicsView):
         ):
             self.undo_last_geometry_edit()
             return
-        if event.key() == Qt.Key_F:
-            print("fit grid to window")
-            self.fit_grid_to_window()
-            return
         if (
             self.current_extended_patch is not None
             and Qt.Key_1 <= event.key() <= Qt.Key_9
@@ -3539,24 +3577,29 @@ class this_view(QGraphicsView):
         ):
             self.set_pending_main_uv_index(event.key() - Qt.Key_0)
             return
-        if event.key() == Qt.Key_Escape:
-            self.cancel_current_operation()
-            return
-        if event.key() == Qt.Key_U:
-            print("resetting zoom_level to 1")
-            self.auto_fit_on_resize = False
-            self.apply_view_scale(1.0)
-        if event.key() == 80:    #   p
-            self.commit_current_patch()
-            return
-
-        if event.key() == Qt.Key_B:
-            self.enable_current_patch_bezier()
-            return
-
-        if event.key() == Qt.Key_E:
-            self.create_extended_patch_preview()
-            return
+        # A containing grid_editor_window owns these shortcuts.  Keep this
+        # fallback for standalone views and direct programmatic key events,
+        # while ensuring a real window key press has only one command owner.
+        if self.document_window is None:
+            if event.key() == Qt.Key_F:
+                print("fit grid to window")
+                self.fit_grid_to_window()
+                return
+            if event.key() == Qt.Key_Escape:
+                self.cancel_current_operation()
+                return
+            if event.key() == Qt.Key_U:
+                self.reset_zoom()
+                return
+            if event.key() == Qt.Key_P:
+                self.commit_current_patch()
+                return
+            if event.key() == Qt.Key_B:
+                self.enable_current_patch_bezier()
+                return
+            if event.key() == Qt.Key_E:
+                self.create_extended_patch_preview()
+                return
 
         if event.key() == Qt.Key_Delete:
             delete_selected_element(self)
@@ -3569,6 +3612,7 @@ class this_view(QGraphicsView):
             self.right_pan_active = True
             self.right_pan_last_pos = event.pos()
             self.auto_fit_on_resize = False
+            self.restore_full_scene_rect()
             self.viewport().setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
@@ -3742,13 +3786,15 @@ class this_view(QGraphicsView):
         else:
             if not zoom_rect.isEmpty():
                 self.auto_fit_on_resize = False
+                zoom_center = self.mapToScene(zoom_rect.center())
+                self.restore_full_scene_rect()
                 viewport_rect = self.viewport().rect()
                 zoom_factor_x = viewport_rect.width()  / zoom_rect.width()
                 zoom_factor_y = viewport_rect.height() / zoom_rect.height()
                 zoom_factor   = min(zoom_factor_x, zoom_factor_y)
                 self.zoom_level *= zoom_factor
  
-                self.centerOn(self.mapToScene(zoom_rect.center()))
+                self.centerOn(zoom_center)
                 self.apply_view_scale(self.zoom_level)
         self.finish_rubber_band()
 
@@ -3788,7 +3834,7 @@ class extended_patch_controls(QGroupBox):
 
         layout.addWidget(QLabel("Radial layers:"))
         self.radial_layers_spin = QSpinBox()
-        self.radial_layers_spin.setRange(1, 9)
+        self.radial_layers_spin.setRange(1, MAX_RADIAL_LAYERS)
         layout.addWidget(self.radial_layers_spin)
         self.radial_note_label = QLabel("")
         layout.addWidget(self.radial_note_label)
@@ -4020,6 +4066,8 @@ class grid_editor_window(QMainWindow):
         layout.addWidget(self.view, 1)
         self.setCentralWidget(central_widget)
         self._create_file_menu()
+        self._create_command_shortcuts()
+        QApplication.instance().installEventFilter(self)
         self.update_window_title()
 
     def _create_file_menu(self):
@@ -4040,6 +4088,55 @@ class grid_editor_window(QMainWindow):
         self.exit_action = QAction("E&xit", self)
         self.exit_action.triggered.connect(self.close)
         file_menu.addAction(self.exit_action)
+
+    def _create_command_shortcuts(self):
+        command_specs = (
+            ("fit", "Fit grid to window", Qt.Key_F,
+             self.view.fit_grid_to_window),
+            ("preview", "Create extended patch preview", Qt.Key_E,
+             self.view.create_extended_patch_preview),
+            ("bezier", "Enable patch Bezier mode", Qt.Key_B,
+             self.view.enable_current_patch_bezier),
+            ("commit", "Commit current patch", Qt.Key_P,
+             self.view.commit_current_patch),
+            ("reset_zoom", "Reset zoom", Qt.Key_U,
+             self.view.reset_zoom),
+            ("cancel", "Cancel current operation", Qt.Key_Escape,
+             self.view.cancel_current_operation),
+        )
+        self.command_actions = {}
+        self._command_actions_by_key = {}
+        for name, text, key, callback in command_specs:
+            action = QAction(text, self)
+            action.setShortcut(QKeySequence(key))
+            action.setShortcutContext(Qt.WindowShortcut)
+            action.triggered.connect(
+                lambda unused_checked=False, command=callback: command()
+            )
+            self.addAction(action)
+            self.command_actions[name] = action
+            self._command_actions_by_key[key] = action
+
+    def eventFilter(self, watched, event):
+        # QSpinBox consumes ordinary letter key presses before a
+        # Qt.WindowShortcut can fire.  Route only this window's unmodified
+        # command keys as a fallback; QAction remains the normal command path.
+        if (
+            event.type() == QEvent.KeyPress
+            and event.modifiers() == Qt.NoModifier
+            and hasattr(watched, "window")
+            and watched.window() is self
+        ):
+            action = self._command_actions_by_key.get(event.key())
+            if action is not None:
+                if isinstance(watched, (QLineEdit, QPlainTextEdit, QTextEdit)):
+                    parent = watched.parentWidget()
+                    if not isinstance(parent, QAbstractSpinBox):
+                        return super().eventFilter(watched, event)
+                action.trigger()
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
 
     def update_window_title(self):
         title = "JOREK Grid Editor"

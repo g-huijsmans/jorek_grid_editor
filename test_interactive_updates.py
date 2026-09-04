@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from PySide2.QtCore import QPoint, QPointF, QRect, Qt
 from PySide2.QtGui import QBrush, QColor, QPainterPath, QPen, QTransform
+from PySide2.QtTest import QTest
 from PySide2.QtWidgets import (
     QApplication, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsScene,
 )
@@ -923,6 +924,59 @@ def test_resize_fits_only_active_grid_with_uniform_transform(monkeypatch):
     view.close()
 
 
+def test_fit_centers_combined_grid_and_wall_without_resize_drift(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    scene = QGraphicsScene()
+    view = this_view()
+    view.setScene(scene)
+    nodes_xx = np.zeros((2, 4, 2))
+    nodes_xx[:, 0, 0] = [0.0, 0.0]
+    nodes_xx[:, 0, 1] = [100.0, 40.0]
+    nodes = [
+        jorek_node_item(index, nodes_xx[:, :, index], 0)
+        for index in range(2)
+    ]
+    for node in nodes:
+        scene.addItem(node)
+
+    wall_path = QPainterPath(QPointF(-10.0, -20.0))
+    wall_path.lineTo(QPointF(120.0, 60.0))
+    wall = QGraphicsPathItem(wall_path)
+    scene.addItem(wall)
+    view.wall_outline_item = wall
+
+    # Model non-fit graphics (for example editing handles) that make the
+    # scene rectangle asymmetric while remaining small enough that Qt has no
+    # scrollbar range after fitting.
+    scene.addItem(QGraphicsEllipseItem(-15.0, -25.0, 1.0, 1.0))
+    monkeypatch.setattr(grid_editor5, "node_list", nodes, raising=False)
+    monkeypatch.setattr(grid_editor5, "element_list", [], raising=False)
+
+    view.resize(600, 400)
+    view.show()
+    app.processEvents()
+    fit_center = view.grid_bounding_rect().center()
+    for size in ((600, 400), (800, 500), (500, 700), (600, 400)):
+        view.resize(*size)
+        app.processEvents()
+        view.fit_grid_to_window()
+        app.processEvents()
+        mapped_center = view.mapToScene(view.viewport().rect().center())
+        transform = view.transform()
+        horizontal_error = abs(
+            mapped_center.x() - fit_center.x()
+        ) * abs(transform.m11())
+        vertical_error = abs(
+            mapped_center.y() - fit_center.y()
+        ) * abs(transform.m22())
+        assert horizontal_error <= 2.0
+        assert vertical_error <= 2.0
+        assert transform.m11() > 0.0
+        assert transform.m22() < 0.0
+        assert view.auto_fit_on_resize
+    view.close()
+
+
 def test_resize_preserves_manual_view_transform_when_auto_fit_is_disabled():
     app = QApplication.instance() or QApplication([])
     scene = QGraphicsScene(-1000.0, -1000.0, 2000.0, 2000.0)
@@ -1111,7 +1165,9 @@ def regular_automatic_extended_patch(monkeypatch):
     return grid_editor5.extended_patch(nodes[:3], edges)
 
 
-@pytest.mark.parametrize("radial_layers", [1, 2, 3, 4])
+@pytest.mark.parametrize(
+    "radial_layers", [1, 2, 3, 4, 10, 20, grid_editor5.MAX_RADIAL_LAYERS]
+)
 def test_automatic_zero_cap_extent_is_one_base_width_per_layer(
     monkeypatch, radial_layers
 ):
@@ -1129,6 +1185,19 @@ def test_automatic_zero_cap_extent_is_one_base_width_per_layer(
     for column in range(len(patch.ordered_nodes)):
         row_y = [row[column].position.y() for row in patch.preview_node_rows]
         assert np.diff(row_y) == pytest.approx(np.ones(radial_layers))
+
+
+def test_radial_layer_limit_rejects_only_values_above_central_max(monkeypatch):
+    patch = regular_automatic_extended_patch(monkeypatch)
+    patch.set_radial_layers(grid_editor5.MAX_RADIAL_LAYERS)
+    assert patch.radial_layers == grid_editor5.MAX_RADIAL_LAYERS
+
+    with pytest.raises(ValueError, match=str(grid_editor5.MAX_RADIAL_LAYERS)):
+        patch.set_radial_layers(grid_editor5.MAX_RADIAL_LAYERS + 1)
+
+    view = this_view()
+    with pytest.raises(ValueError, match=str(grid_editor5.MAX_RADIAL_LAYERS)):
+        view.set_extended_radial_layers(grid_editor5.MAX_RADIAL_LAYERS + 1)
 
 
 def test_automatic_zero_cap_layer_changes_recompute_from_base_width(monkeypatch):
@@ -3738,6 +3807,28 @@ def test_extended_patch_panel_updates_uncapped_and_capped_radial_layers():
     assert app is not None
 
 
+def test_radial_layer_spinbox_accepts_multi_digit_values():
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    controls = grid_editor5.extended_patch_controls(view)
+
+    assert controls.radial_layers_spin.minimum() == 1
+    assert (
+        controls.radial_layers_spin.maximum()
+        == grid_editor5.MAX_RADIAL_LAYERS
+    )
+    for value in (12, 25, 50):
+        editor = controls.radial_layers_spin.lineEdit()
+        editor.setFocus()
+        editor.selectAll()
+        QTest.keyClicks(editor, str(value))
+        QTest.keyClick(editor, Qt.Key_Return)
+        app.processEvents()
+        assert controls.radial_layers_spin.value() == value
+        assert view.pending_radial_layers == value
+    controls.close()
+
+
 def test_extended_patch_panel_buttons_route_to_view_methods(monkeypatch):
     app = QApplication.instance() or QApplication([])
     view = this_view()
@@ -3779,6 +3870,76 @@ def test_grid_editor_window_wraps_independently_constructed_view():
     assert layout.itemAt(1).widget() is window.view
     window.close()
     assert app is not None
+
+
+def test_window_commands_work_once_from_each_child_focus(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    view = this_view()
+    calls = []
+    command_methods = {
+        "fit_grid_to_window": "fit",
+        "create_extended_patch_preview": "preview",
+        "enable_current_patch_bezier": "bezier",
+        "commit_current_patch": "commit",
+        "reset_zoom": "reset_zoom",
+        "cancel_current_operation": "cancel",
+    }
+    for method_name, command_name in command_methods.items():
+        monkeypatch.setattr(
+            view, method_name,
+            lambda name=command_name: calls.append(name),
+        )
+
+    window = grid_editor5.grid_editor_window(view)
+    window.resize(900, 600)
+    window.show()
+    app.processEvents()
+    focus_widgets = (
+        view,
+        window.patch_controls.radial_layers_spin,
+        window.patch_controls.outer_boundary_combo,
+        window.patch_controls.preview_button,
+        window.patch_controls.fit_button,
+    )
+    commands = (
+        (Qt.Key_F, "fit"),
+        (Qt.Key_E, "preview"),
+        (Qt.Key_B, "bezier"),
+        (Qt.Key_P, "commit"),
+        (Qt.Key_U, "reset_zoom"),
+        (Qt.Key_Escape, "cancel"),
+    )
+    for key, command_name in commands:
+        calls.clear()
+        for widget in focus_widgets:
+            widget.setFocus()
+            app.processEvents()
+            QTest.keyClick(widget, key)
+            app.processEvents()
+        assert calls == [command_name] * len(focus_widgets)
+
+    window.close()
+    assert app is not None
+
+
+def test_window_numeric_shortcuts_do_not_steal_spinbox_entry():
+    app = QApplication.instance() or QApplication([])
+    window = grid_editor5.grid_editor_window()
+    window.show()
+    app.processEvents()
+    spin = window.patch_controls.radial_layers_spin
+    editor = spin.lineEdit()
+
+    for value in (12, 25, 50):
+        editor.setFocus()
+        editor.selectAll()
+        QTest.keyClicks(editor, str(value))
+        QTest.keyClick(editor, Qt.Key_Return)
+        app.processEvents()
+        assert spin.value() == value
+        assert window.view.pending_radial_layers == value
+
+    window.close()
 
 
 def test_fit_button_and_f_key_use_same_fit_path(monkeypatch):
