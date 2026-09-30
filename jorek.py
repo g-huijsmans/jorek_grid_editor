@@ -1,8 +1,142 @@
 
 import h5py
+import hashlib
 import numpy as np
 import os
+import shutil
+import tempfile
 import time
+
+
+JOREK_RESTART_REQUIRED_DATASETS = frozenset({
+  "x", "boundary", "vertex", "size", "values", "deltas",
+  "jorek_model", "n_var", "n_tor", "n_period", "n_nodes", "n_elements",
+})
+
+
+def jorek_restart_hdf5_status(file_name):
+  """Return ``(is_restart, reason)`` for a conservative JOREK check."""
+  try:
+    with h5py.File(file_name, "r") as hdf5:
+      missing = JOREK_RESTART_REQUIRED_DATASETS.difference(hdf5.keys())
+      if missing:
+        return False, (
+          "The file contains grid geometry but is not a full JOREK restart; "
+          "missing required restart datasets: " + ", ".join(sorted(missing))
+        )
+      non_datasets = sorted(
+        name for name in JOREK_RESTART_REQUIRED_DATASETS
+        if not isinstance(hdf5[name], h5py.Dataset)
+      )
+      if non_datasets:
+        return False, (
+          "Required JOREK restart objects are not datasets: "
+          + ", ".join(non_datasets)
+        )
+  except (OSError, ValueError) as error:
+    return False, "Could not read the source as HDF5: {}".format(error)
+  return True, ""
+
+
+def is_jorek_restart_hdf5(file_name):
+  """Return whether *file_name* has the mandatory JOREK restart markers."""
+  return jorek_restart_hdf5_status(file_name)[0]
+
+
+def validate_jorek_restart_hdf5(file_name):
+  """Raise ``ValueError`` unless *file_name* is a readable JOREK restart."""
+  is_restart, reason = jorek_restart_hdf5_status(file_name)
+  if not is_restart:
+    raise ValueError(reason)
+
+
+def file_sha256(file_name, chunk_size=1024 * 1024):
+  """Return the SHA-256 digest of a file without loading it into memory."""
+  digest = hashlib.sha256()
+  with open(file_name, "rb") as source:
+    for chunk in iter(lambda: source.read(chunk_size), b""):
+      digest.update(chunk)
+  return digest.hexdigest()
+
+
+def _same_file_path(first, second):
+  first_path = os.path.normcase(os.path.realpath(os.path.abspath(first)))
+  second_path = os.path.normcase(os.path.realpath(os.path.abspath(second)))
+  if first_path == second_path:
+    return True
+  if os.path.exists(first) and os.path.exists(second):
+    try:
+      return os.path.samefile(first, second)
+    except OSError:
+      pass
+  return False
+
+
+def clone_jorek_restart_hdf5(source, destination):
+  """Atomically create an exact, validated copy of a JOREK restart."""
+  source = os.path.abspath(source)
+  destination = os.path.abspath(destination)
+  if _same_file_path(source, destination):
+    raise ValueError("The exported restart must not overwrite its source file")
+  validate_jorek_restart_hdf5(source)
+
+  destination_directory = os.path.dirname(destination) or os.curdir
+  os.makedirs(destination_directory, exist_ok=True)
+  descriptor, temporary_filename = tempfile.mkstemp(
+    prefix=".jorek_restart_", suffix=".h5", dir=destination_directory,
+  )
+  os.close(descriptor)
+  try:
+    shutil.copy2(source, temporary_filename)
+    validate_jorek_restart_hdf5(temporary_filename)
+    source_digest = file_sha256(source)
+    copied_digest = file_sha256(temporary_filename)
+    if source_digest != copied_digest:
+      raise OSError("Restart copy failed byte-for-byte SHA-256 validation")
+    os.replace(temporary_filename, destination)
+  finally:
+    if os.path.exists(temporary_filename):
+      os.remove(temporary_filename)
+  return source_digest
+
+
+def _copied_hdf5_attributes(hdf5_object):
+  attributes = {}
+  for name, value in hdf5_object.attrs.items():
+    attributes[name] = np.array(value, copy=True) if isinstance(
+      value, np.ndarray
+    ) else value
+  return attributes
+
+
+def hdf5_inventory(file_name):
+  """Return recursive HDF5 object metadata without reading dataset values."""
+  inventory = {}
+  with h5py.File(file_name, "r") as hdf5:
+    inventory["/"] = {
+      "type": "group",
+      "attributes": _copied_hdf5_attributes(hdf5),
+    }
+
+    def record(name, hdf5_object):
+      path = "/" + name
+      entry = {
+        "type": "dataset" if isinstance(hdf5_object, h5py.Dataset)
+        else "group",
+        "attributes": _copied_hdf5_attributes(hdf5_object),
+      }
+      if isinstance(hdf5_object, h5py.Dataset):
+        entry.update({
+          "shape": hdf5_object.shape,
+          "dtype": hdf5_object.dtype.str,
+          "chunks": hdf5_object.chunks,
+          "compression": hdf5_object.compression,
+          "compression_opts": hdf5_object.compression_opts,
+        })
+      inventory[path] = entry
+
+    hdf5.visititems(record)
+  return inventory
 
 class jorek:
   def __init__(self,key):

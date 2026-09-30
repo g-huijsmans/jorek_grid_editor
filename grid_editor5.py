@@ -4057,6 +4057,9 @@ class grid_editor_window(QMainWindow):
         self.view.document_window = self
         self.current_filename = None
         self.source_is_grid_only = True
+        self.source_restart_filename = None
+        self.source_restart_geometry = None
+        self.restart_source_reason = "Open a full JOREK restart first"
         self.patch_controls = extended_patch_controls(self.view)
         central_widget = QWidget(self)
         layout = QHBoxLayout(central_widget)
@@ -4084,6 +4087,13 @@ class grid_editor_window(QMainWindow):
         self.save_as_action.setShortcut("Ctrl+Shift+S")
         self.save_as_action.triggered.connect(self.save_grid_as_dialog)
         file_menu.addAction(self.save_as_action)
+        self.export_restart_action = QAction(
+            "Save JOREK &restart As...", self
+        )
+        self.export_restart_action.triggered.connect(
+            self.export_restart_dialog
+        )
+        file_menu.addAction(self.export_restart_action)
         file_menu.addSeparator()
         self.exit_action = QAction("E&xit", self)
         self.exit_action.triggered.connect(self.close)
@@ -4203,6 +4213,7 @@ class grid_editor_window(QMainWindow):
         )
         try:
             new_grid = jorek_grid(id_generator()).read_grid_hdf5(filename)
+            is_restart, restart_reason = jorek_restart_hdf5_status(filename)
             if DIAGNOSTIC_BASIS_SCALE:
                 _diagnostic_nodes_xx_before = new_grid.nodes_xx.copy()
             report_grid_array_memory(new_grid)
@@ -4264,6 +4275,17 @@ class grid_editor_window(QMainWindow):
         self.view.pending_bezier_mode = True
         self.current_filename = os.path.abspath(filename)
         self.source_is_grid_only = new_grid.grid_only_source
+        self.source_restart_filename = (
+            self.current_filename if is_restart else None
+        )
+        self.restart_source_reason = restart_reason
+        self.source_restart_geometry = (
+            tuple(np.array(array, copy=True) for array in (
+                new_grid.nodes_xx, new_grid.boundary, new_grid.vertices,
+                new_grid.elements_size,
+            ))
+            if is_restart else None
+        )
         self.view.document_modified = False
         self.view.set_patch_status("Grid opened")
         self.patch_controls.update_wall_label()
@@ -4346,6 +4368,80 @@ class grid_editor_window(QMainWindow):
         if not os.path.splitext(filename)[1]:
             filename += ".h5"
         return self.save_grid_file(filename, interactive=True)
+
+    def _validate_unchanged_restart_geometry(self):
+        if (
+            self.source_restart_filename is None
+            or self.source_restart_geometry is None
+        ):
+            reason = self.restart_source_reason or (
+                "The opened grid is not a full JOREK restart"
+            )
+            raise ValueError(reason)
+
+        nodes = list(globals().get("node_list", []))
+        elements = list(globals().get("element_list", []))
+        if (
+            any(not getattr(node, "active", True) for node in nodes)
+            or any(not getattr(element, "active", True) for element in elements)
+            or [node.index for node in nodes] != list(range(len(nodes)))
+            or [element.index for element in elements]
+            != list(range(len(elements)))
+        ):
+            raise ValueError(RESTART_EXPORT_COMPACTION_ERROR)
+
+        live_geometry = live_grid_arrays()
+        labels = ("x", "boundary", "vertex", "size")
+        for label, live_array, source_array in zip(
+            labels, live_geometry, self.source_restart_geometry
+        ):
+            live_array = np.asarray(live_array)
+            source_array = np.asarray(source_array)
+            if (
+                live_array.shape != source_array.shape
+                or not np.array_equal(live_array, source_array)
+            ):
+                raise ValueError(
+                    RESTART_EXPORT_UNCHANGED_GRID_ERROR
+                    + " Geometry dataset '{}' differs from the source."
+                    .format(label)
+                )
+        return live_geometry
+
+    def export_restart_file(self, filename, interactive=False):
+        """Export an unchanged full restart without changing document state."""
+        try:
+            if not filename:
+                raise ValueError("Choose a destination for the JOREK restart")
+            self._validate_unchanged_restart_geometry()
+            clone_jorek_restart_hdf5(
+                self.source_restart_filename, os.path.abspath(filename)
+            )
+        except Exception as error:
+            self._report_file_error(
+                "Could not export JOREK restart", error, interactive
+            )
+            return False
+        self.view.set_patch_status("JOREK restart exported")
+        return True
+
+    def export_restart_dialog(self):
+        if self.source_restart_filename:
+            base, unused_extension = os.path.splitext(
+                self.source_restart_filename
+            )
+            suggested = base + "_edited_restart.h5"
+        else:
+            suggested = "jorek_edited_restart.h5"
+        filename, unused_filter = QFileDialog.getSaveFileName(
+            self, "Save JOREK restart", suggested,
+            "JOREK HDF5 files (*.h5 *.hdf5);;All files (*)",
+        )
+        if not filename:
+            return False
+        if not os.path.splitext(filename)[1]:
+            filename += ".h5"
+        return self.export_restart_file(filename, interactive=True)
 
     def maybe_save_changes(self):
         if not self.view.document_modified:
@@ -7066,6 +7162,14 @@ class jorek_node_item(QGraphicsItem):
 SIMPLE_SAVE_COMPACTION_ERROR = (
     "Saving grids with deleted nodes/elements requires mesh compaction and "
     "renumbering. This is not implemented yet."
+)
+RESTART_EXPORT_COMPACTION_ERROR = (
+    "Restart export with deleted nodes/elements requires mesh compaction and "
+    "renumbering, which is not implemented yet."
+)
+RESTART_EXPORT_UNCHANGED_GRID_ERROR = (
+    "Full restart export currently supports unchanged grids only. Physics "
+    "interpolation for edited or new nodes is not implemented yet."
 )
 
 
